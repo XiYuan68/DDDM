@@ -1,0 +1,9 @@
+numpy
+torch
+torchvision
+joblib
+pytorch_model_summary
+scipy
+foolbox
+eagerpy
+matplotlib
