@@ -684,9 +684,9 @@ def load_acc(mode: str, *args: list):
     Parameters
     ----------
     mode : str
-        type of data, [attack|bayes].
+        type of data, one of [ attack | bayes ].
     *args : list
-        other arguments.
+        other arguments of desired `.npz` file, depend on `utils.get_npz_mode()`.
 
     Returns
     -------

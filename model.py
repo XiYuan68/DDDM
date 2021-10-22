@@ -8,6 +8,7 @@ Created on Wed Sep 15 21:57:20 2021
 define architecture of neural network models and process of bayesian inference.
 """
 from itertools import permutations
+import gc
 
 import numpy as np
 import torch
@@ -237,11 +238,8 @@ def bayesian_inference(trial: np.ndarray,
     """
 
     n_trial, len_trial, n_choice = trial.shape
-    # [n_trial, len_trial, n_channel] --> [n_trial * len_trial, n_channel]
-    trial = np.concatenate(trial)
-    # [n_trial * len_trial] --> [n_trial, len_trial]
-    idx_combination = output2index(trial, n_channel)
-    idx_combination = np.stack(np.split(idx_combination, n_trial, axis=0), axis=0)
+    idx_combination = [output2index(trial[:, i]) for i in range(len_trial)]
+    idx_combination = np.stack(idx_combination, axis=1)
 
     belief_post = np.full([n_trial, len_trial, n_choice], 1 / n_choice)
     for t in range(1, len_trial):
