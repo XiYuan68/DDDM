@@ -26,19 +26,24 @@ from model import MNISTCNN, load_model, get_likelihood, bayesian_inference
 from utils import get_pt_model, get_npz
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# whether train different models on different GPUs or
+# whether perform attack/prediction with single model on multiple GPUs if available
+PARRALEL = torch.cuda.device_count() > 1
 PROPORTION = 0.1
 DROPOUT = [0, 0.2, 0.4, 0.6, 0.8]
 METHOD = ['clean', 'pgd']
 METHOD_TITLE = ['Clean', 'PGD']
-EPSILON = [0, 0.3]
-EPSILON_FIGURE = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+EPSILON_MNIST = [0, 0.3]
+EPSILON_MNIST_FIGURE = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+EPSILON_CIFAR10 = [0, 0.03]
 
 
 def train_epoch(model: torch.nn.Module, 
                 loader: torch.utils.data.DataLoader, 
                 loss_func: torch.nn.modules.loss._Loss, 
-                optimizer: torch.optim.Optimizer):
+                optimizer: torch.optim.Optimizer,
+                device: str = DEVICE):
     """
     Train given model for one epoch.
 
@@ -52,6 +57,8 @@ def train_epoch(model: torch.nn.Module,
         pytorch loss function.
     optimizer : torch.optim.Optimizer
         pytorch optimizer.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
 
     Returns
     -------
@@ -86,7 +93,8 @@ def train_epoch(model: torch.nn.Module,
 def predict_epoch(model: torch.nn.Module, 
                   loader: torch.utils.data.DataLoader, 
                   loss_func: torch.nn.modules.loss._Loss = None, 
-                  return_output: bool = False):
+                  return_output: bool = False,
+                  device: str = DEVICE):
     """
     Let given neural network make predicitons.
 
@@ -100,6 +108,8 @@ def predict_epoch(model: torch.nn.Module,
         pytorch loss function. The default is None.
     return_output : bool, optional
         whether return model prediction. The default is False.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
 
         when False, mean loss and accuracy of this epoch will be returned.
 
@@ -144,7 +154,9 @@ def train_model(dataset='mnist',
                 batch_size: int = 64, 
                 epochs: int = 50, 
                 save: bool = True, 
-                patience: int = 20):
+                patience: int = 20,
+                device: str = DEVICE,
+                num_workers: int = 4):
     """
     Train a neural network.
 
@@ -167,6 +179,10 @@ def train_model(dataset='mnist',
     patience : int, optional
         training will be stopped if validation loss stops decreasing in *patience* epochs. 
         The default is 20.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
+    num_workers: int, optional
+        how many subprocesses to use for data. The default is 4.
 
     Returns
     -------
@@ -176,13 +192,14 @@ def train_model(dataset='mnist',
     """
 
     print('Training', dataset, architecture, index, dropout)
-    if architecture == 'cnn':
-        model = eval((dataset+'cnn').upper())(dropout).to(device)
+    if dataset == 'mnist' and architecture == 'cnn':
+        model = MNISTCNN(dropout).to(device)
     loss_func = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters())
     loader_train = get_loader(dataset, subset='train', batch_size=batch_size,
-                              shuffle=True)
-    loader_val = get_loader(dataset, subset='val', batch_size=batch_size)
+                              shuffle=True, num_workers=num_workers)
+    loader_val = get_loader(dataset, subset='val', batch_size=batch_size, 
+                            num_workers=num_workers)
     pt = get_pt_model(dataset, architecture, index, dropout)
     
     loss_val_min = 0
@@ -191,8 +208,9 @@ def train_model(dataset='mnist',
         if i > idx_epoch_saved + patience:
             print('Early Stopping')
             break
-        loss_train, acc_train = train_epoch(model, loader_train, loss_func, optimizer)
-        loss_val, acc_val = predict_epoch(model, loader_val, loss_func)
+        loss_train, acc_train = train_epoch(model, loader_train, loss_func, 
+                                            optimizer, device)
+        loss_val, acc_val = predict_epoch(model, loader_val, loss_func, device)
             
         print('Epoch [{}/{}], Train Loss: {:.4f}, Train Acc: {:.2f}, Val Loss: {:.4f}, Val Acc: {:.2f}' 
                .format(i+1, epochs, loss_train, acc_train, loss_val, acc_val))
@@ -203,7 +221,7 @@ def train_model(dataset='mnist',
             torch.save(model.state_dict(), pt)
             idx_epoch_saved = i
     
-    return model    
+    return model
 
 
 def attack_model(dataset: str = 'mnist', 
@@ -216,7 +234,9 @@ def attack_model(dataset: str = 'mnist',
                  subset: str = 'test', 
                  proportion: float = PROPORTION, 
                  batch_size: int = 512, 
-                 save: bool = True):
+                 save: bool = True,
+                 device: str = DEVICE,
+                 num_workers: int = 4):
     """
     Attack neural network if method!='clean'.
 
@@ -244,6 +264,10 @@ def attack_model(dataset: str = 'mnist',
         batch size. The default is 512.
     save : bool, optional
         whether save generated adversarial samples. The default is True.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
+    num_workers: int, optional
+        how many subprocesses to use for data. The default is 4.
 
     Returns
     -------
@@ -253,17 +277,18 @@ def attack_model(dataset: str = 'mnist',
     """
     print('Attacking', dataset, architecture, index, dropout_train, dropout_test, 
           method, epsilon, subset, proportion)
-    model = load_model(dataset, architecture, index, dropout_train, dropout_test)
+    model = load_model(dataset, architecture, index, dropout_train, dropout_test,
+                       device, PARRALEL)
     x_attacked = []
 
     # attack CNN
     if architecture == 'cnn':
         loader = get_loader(dataset, subset=subset, proportion=proportion, 
-                            batch_size=batch_size)
+                            batch_size=batch_size, num_workers=num_workers)
         
     # no attacks, clean evaluation
     if method == 'clean':
-        acc = predict_epoch(model, loader)[-1]
+        acc = predict_epoch(model, loader, device=device)[-1]
     
     # attack model
     else:
@@ -305,7 +330,9 @@ def save_output(dataset: str = 'mnist',
                 subset: str = 'test', 
                 proportion: float = PROPORTION, 
                 repeat: int = 100,
-                batch_size: int = 1024):
+                batch_size: int = 1024,
+                device: str = DEVICE,
+                num_workers: int = 4):
     """
     Save neural network output.
 
@@ -333,6 +360,10 @@ def save_output(dataset: str = 'mnist',
         number of neural network prediction of each sample. The default is 100.
     batch_size : int, optional
         batch size. The default is 1024.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
+    num_workers: int, optional
+        how many subprocesses to use for data. The default is 4.
 
     Returns
     -------
@@ -343,12 +374,13 @@ def save_output(dataset: str = 'mnist',
     print('Saving Output', dataset, architecture, index, dropout_train, dropout_test, 
           method, epsilon, subset, proportion, repeat)
     loader = get_loader(dataset, architecture, index, dropout_train, dropout_test,
-                        method, epsilon, subset, proportion, batch_size)
+                        method, epsilon, subset, proportion, batch_size, num_workers)
 
-    model = load_model(dataset, architecture, index, dropout_train, dropout_test)
+    model = load_model(dataset, architecture, index, dropout_train, dropout_test,
+                       device, PARRALEL)
     output = []
     for i in range(repeat):
-        output.append(predict_epoch(model, loader, return_output=True))
+        output.append(predict_epoch(model, loader, return_output=True, device=device))
     output = softmax(np.stack(output, axis=0), axis=-1)
 
     npz = get_npz('output', dataset, architecture, index, dropout_train, 
@@ -498,6 +530,67 @@ def save_bayes(dataset: str = 'mnist',
     return acc, result
 
 
+def train_model_multiple(dataset='mnist', 
+                         architecture: str = 'cnn', 
+                         index: int = 0, 
+                         dropout: list = DROPOUT, 
+                         batch_size: int = 64, 
+                         epochs: int = 50, 
+                         save: bool = True, 
+                         patience: int = 20,
+                         device: list = list(range(len(DROPOUT))),
+                         num_workers: int = 4):
+    """
+    Train multiple models (on multiple GPUs simultaneously if available).
+
+    Parameters
+    ----------
+    dataset : str, optional
+        name of dataset. The default is 'mnist'.
+    architecture : str, optional
+        architecture of the neural network. The default is 'cnn'.
+    index : int, optional
+        index of data to return. The default is 0.
+    dropout : list, optional
+        training and testing dropout rates. The default is DROPOUT.
+    batch_size : int, optional
+        batch size. The default is 64.
+    epochs : int, optional
+        number of maximum training epochs. The default is 50.
+    save : bool, optional
+        whether save model after training. The default is True.
+    patience : int, optional
+        training will be stopped if validation loss stops decreasing in *patience* epochs. 
+        The default is 20.
+    device : list of ints, optional
+        indexs of GPUs on which the models are loaded.
+        The default is None, same as list(range(len(dropout))).
+    num_workers: int, optional
+        how many subprocesses to use for data loader. The default is 4.
+
+    Returns
+    -------
+    None.
+
+    """
+    # train models on multiple GPUs simultaneously
+    if PARRALEL:
+        if device is None:
+            device = list(range(len(dropout)))
+        assert len(device) == DROPOUT, 'number of GPUs != number of dropout rates'
+        device = ['cuda:'+str(i) for i in device]
+        # create a bash script to run multiple train_single_model.py simultaneously
+        pass
+        # run the bash script
+        pass
+    # train models on single GPU
+    else:
+        device = DEVICE
+        for i in dropout:
+            train_model(dataset, architecture, index, i, batch_size, epochs,
+                        save, patience, device, num_workers)
+
+
 def pipeline_multidropout(dataset: str = 'mnist', 
                           architecture: str = 'cnn',
                           index: int = 0, 
@@ -512,7 +605,9 @@ def pipeline_multidropout(dataset: str = 'mnist',
                           n_trial: int = 10, 
                           boundary: float = 0.99, 
                           n_channel: int = 3,
-                          batch_size: int = 512):
+                          batch_size: int = 512,
+                          device: str = DEVICE,
+                          num_workers: int = 4):
     """
     Convenient function to attack neural networks of multiple dropout rates.
 
@@ -549,6 +644,10 @@ def pipeline_multidropout(dataset: str = 'mnist',
         number of channel for likelihood estimation. The default is 3.
     batch_size : int, optional
         batch size. The default is 512.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
+    num_workers: int, optional
+        how many subprocesses to use for data. The default is 4.
 
     Returns
     -------
@@ -566,9 +665,9 @@ def pipeline_multidropout(dataset: str = 'mnist',
         for j in dropout:
             for s, p, r in zip(*spr):
                 attack_model(dataset, architecture, index, i, j, method, epsilon,
-                             s, p, batch_size)
+                              s, p, batch_size, device, num_workers)
                 save_output(dataset, architecture, index, i, j, method, epsilon,
-                            s, p, r, batch_size)
+                            s, p, r, batch_size, device, num_workers)
             
             args_likelihood.append([dataset, architecture, index, i, j, method, 
                                     epsilon, 'train', proportion_train, repeat_train, 
@@ -576,7 +675,9 @@ def pipeline_multidropout(dataset: str = 'mnist',
             args_bayes.append([dataset, architecture, index, i, j, method, epsilon,
                                 'test', proportion_test, repeat_test, len_trial, 
                                 n_trial, boundary, n_channel, repeat_train])
+    print('likelihood')
     Parallel(-1)(delayed(save_likelihood)(*i) for i in args_likelihood)
+    print('bayes')
     Parallel(-1)(delayed(save_bayes)(*i) for i in args_bayes)
 
 
@@ -586,7 +687,7 @@ def pipeline_multiepsilon(dataset: str = 'mnist',
                           dropout_train: float = 0, 
                           dropout_test: float = 0, 
                           method: str = 'pgd', 
-                          epsilon: list = EPSILON_FIGURE, 
+                          epsilon: list = EPSILON_MNIST_FIGURE, 
                           subset: str = 'test', 
                           proportion_train: float = PROPORTION, 
                           repeat_train: int = 10,
@@ -596,7 +697,9 @@ def pipeline_multiepsilon(dataset: str = 'mnist',
                           n_trial: int = 10, 
                           boundary: float = 0.99, 
                           n_channel: int = 3,
-                          batch_size: int = 512):
+                          batch_size: int = 512,
+                          device: str = DEVICE,
+                          num_workers: int = 4):
     """
     Convenient function to attack neural networks with multiple epsilons.
 
@@ -632,18 +735,16 @@ def pipeline_multiepsilon(dataset: str = 'mnist',
         number of channel for likelihood estimation. The default is 3.
     batch_size : int, optional
         batch size. The default is 512.
+    device : str, optional
+        device on which the model is loaded. The default is DEVICE.
+    num_workers: int, optional
+        how many subprocesses to use for data. The default is 4.
 
     Returns
     -------
     None.
 
     """
-    # skip default epsilon of given method
-    epsilon_default = EPSILON[METHOD.index(method)]
-    if epsilon_default in epsilon:
-        print('Skipping epsilon', epsilon_default)
-        epsilon.remove(epsilon_default)
-
     # spr stands for subset, proportion, repeat
     spr = [['train', 'test'], 
            [proportion_train, proportion_test], 
@@ -654,9 +755,9 @@ def pipeline_multiepsilon(dataset: str = 'mnist',
     for i in epsilon:
         for s, p, r in zip(*spr):
             attack_model(dataset, architecture, index, dropout_train, dropout_test, 
-                         method, i, s, p, batch_size)
+                          method, i, s, p, batch_size, device, num_workers)
             save_output(dataset, architecture, index, dropout_train, dropout_test, 
-                        method, i, s, p, r, batch_size)
+                        method, i, s, p, r, batch_size, device, num_workers)
         args_likelihood.append([dataset, architecture, index, dropout_train, 
                                 dropout_test, method, i, 'train', proportion_train, 
                                 repeat_train, n_channel])
@@ -664,17 +765,17 @@ def pipeline_multiepsilon(dataset: str = 'mnist',
                            method, i, 'test', proportion_test, repeat_test, len_trial, 
                            n_trial, boundary, n_channel, repeat_train])
     Parallel(-1)(delayed(save_likelihood)(*i) for i in args_likelihood)
-    Parallel(-1)(delayed(save_bayes)(*i) for i in args_bayes)        
+    Parallel(-1)(delayed(save_bayes)(*i) for i in args_bayes)
     pass
 
     
 
 if __name__ == '__main__':
     time0 = time()
-    for i in DROPOUT:
-        train_model(dropout=i)
-    pipeline_multidropout()
-    pipeline_multidropout(method='pgd', epsilon=0.3)
-    pipeline_multiepsilon()
-    pipeline_multiepsilon(dropout_train=0.2, dropout_test=0.6)
+    # for i in DROPOUT:
+        # train_model(dropout=i)
+    # pipeline_multidropout()
+    # pipeline_multidropout(method='pgd', epsilon=0.3)
+    # pipeline_multiepsilon()
+    # pipeline_multiepsilon(dropout_train=0.2, dropout_test=0.6)
     print('Cost %.2f mins'%((time() - time0) / 60))
