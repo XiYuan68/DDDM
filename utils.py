@@ -101,6 +101,69 @@ def get_pt_model(dataset: str = 'mnist',
     return pt
 
 
+def get_txt_trainlog(dataset: str = 'mnist', 
+                     architecture: str = 'cnn', 
+                     index: int = 0, 
+                     dropout: float = 0):
+    """
+    Return path of model training log `.txt` file.
+
+    Parameters
+    ----------
+    dataset : str, optional
+        name of dataset. The default is 'mnist'.
+    architecture : str, optional
+        architecture of the neural network. The default is 'cnn'.
+    index : int, optional
+        index of data to return. The default is 0.
+    dropout : float, optional
+        dropout rate at training phase. The default is 0.
+
+    Returns
+    -------
+    txt : str
+        path of model training log `.txt` file.
+
+    """
+    d = get_dir(dataset, 'model')
+    txt = d + '_'.join([architecture, str(index), str(dropout)]) + '.txt'
+    return txt
+
+
+def update_trainlog(dataset: str = 'mnist', 
+                    architecture: str = 'cnn', 
+                    index: int = 0, 
+                    dropout: float = 0,
+                    line: str = '', 
+                    mode: str = 'a'):
+    """
+    Write meassage in training log.
+
+    Parameters
+    ----------
+    dataset : str, optional
+        name of dataset. The default is 'mnist'.
+    architecture : str, optional
+        architecture of the neural network. The default is 'cnn'.
+    index : int, optional
+        index of data to return. The default is 0.
+    dropout : float, optional
+        dropout rate at training phase. The default is 0.
+    line : str, optional
+        training message to be looged. The default is ''.
+    mode : str, optional
+        mode of opening file. The default is 'a'.
+
+    Returns
+    -------
+    None.
+
+    """
+    txt = get_txt_trainlog(dataset, architecture, index, dropout)
+    with open(txt, mode) as f:
+        f.write(line + '\n')
+
+
 def args2npz(dataset: str, subdir: str, args: list):
     """
     Return path of `.npz` file
