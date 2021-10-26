@@ -72,7 +72,7 @@ def load_model(dataset: str = 'mnist',
                dropout_train: float = 0, 
                dropout_test: float = 0,
                device: str = 'cuda',
-               parallel: bool = True):
+               multigpu: bool = True):
     """
     Load a well-trained model and change its dropout rate.
 
@@ -90,7 +90,7 @@ def load_model(dataset: str = 'mnist',
         dropout rate at test phase. The default is 0.
     device : str, optional
         device on which the model is loaded. The default is 'cuda'.
-    parallel : bool, optional
+    multigpu : bool, optional
         whether perform Data Parallelism on multiplt GPUs. The default is True.
 
     Returns
@@ -108,7 +108,7 @@ def load_model(dataset: str = 'mnist',
     model.load_state_dict(torch.load(pt))
     model.eval()
     # perform Data Parallelism
-    if parallel:
+    if multigpu:
         model = nn.DataParallel(model)
     return model
 
