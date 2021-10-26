@@ -22,9 +22,6 @@ from task import get_loader
 from utils import get_pt_model
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
 class MNISTCNN(nn.Module):
     """
     A simple CNN for MNIST classificaiton.
@@ -69,12 +66,13 @@ class MNISTCNN(nn.Module):
         return output
 
 
-
 def load_model(dataset: str = 'mnist',
                architecture: str = 'cnn',
                index: int = 0, 
                dropout_train: float = 0, 
-               dropout_test: float = 0):
+               dropout_test: float = 0,
+               device: str = 'cuda',
+               parallel: bool = True):
     """
     Load a well-trained model and change its dropout rate.
 
@@ -90,19 +88,28 @@ def load_model(dataset: str = 'mnist',
         dropout rate at training phase. The default is 0.
     dropout_test : float, optional
         dropout rate at test phase. The default is 0.
+    device : str, optional
+        device on which the model is loaded. The default is 'cuda'.
+    parallel : bool, optional
+        whether perform Data Parallelism on multiplt GPUs. The default is True.
 
     Returns
     -------
     model : torch.nn.Module
-        pytorch neural network classifier.
-
+        pytorch neural network classifier.    
     """
-
-    if architecture == 'cnn':
-        pt = get_pt_model(dataset, 'cnn', index, dropout_train)
-        model = eval((dataset+'cnn').upper())(dropout_test).to(device)
-        model.load_state_dict(torch.load(pt))
-        model.eval()
+    # define model
+    if dataset == 'mnist' and architecture == 'cnn':
+        model = MNISTCNN(dropout_test)
+    
+    model = model.to(device)
+    # load pre-trained weights
+    pt = get_pt_model(dataset, architecture, index, dropout_train)
+    model.load_state_dict(torch.load(pt))
+    model.eval()
+    # perform Data Parallelism
+    if parallel:
+        model = nn.DataParallel(model)
     return model
 
 
@@ -266,4 +273,5 @@ def bayesian_inference(trial: np.ndarray,
 
 
 if __name__ == '__main__':
+    model = load_model()
     pass
