@@ -9,6 +9,7 @@ train, test and attack neural networks, estimate likelihood and perform bayesian
 inference.
 """
 from time import time
+import subprocess
 
 import torch
 import numpy as np
@@ -23,13 +24,12 @@ import eagerpy as ep
 
 from task import get_loader, get_trial, get_output_of_category, load_likelihood
 from model import MNISTCNN, load_model, get_likelihood, bayesian_inference
-from utils import get_pt_model, get_npz
+from utils import get_pt_model, get_npz, update_trainlog
 
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# whether train different models on different GPUs or
-# whether perform attack/prediction with single model on multiple GPUs if available
-PARRALEL = torch.cuda.device_count() > 1
+# whether multiple GPUs exist
+MULTIGPU = torch.cuda.device_count() > 1
 PROPORTION = 0.1
 DROPOUT = [0, 0.2, 0.4, 0.6, 0.8]
 METHOD = ['clean', 'pgd']
@@ -43,7 +43,7 @@ def train_epoch(model: torch.nn.Module,
                 loader: torch.utils.data.DataLoader, 
                 loss_func: torch.nn.modules.loss._Loss, 
                 optimizer: torch.optim.Optimizer,
-                device: str = DEVICE):
+                device: str):
     """
     Train given model for one epoch.
 
@@ -58,7 +58,7 @@ def train_epoch(model: torch.nn.Module,
     optimizer : torch.optim.Optimizer
         pytorch optimizer.
     device : str, optional
-        device on which the model is loaded. The default is DEVICE.
+        device on which the model is loaded.
 
     Returns
     -------
@@ -192,6 +192,7 @@ def train_model(dataset='mnist',
     """
 
     print('Training', dataset, architecture, index, dropout)
+    update_trainlog(dataset, architecture, index, dropout, mode='w')
     if dataset == 'mnist' and architecture == 'cnn':
         model = MNISTCNN(dropout).to(device)
     loss_func = torch.nn.CrossEntropyLoss()
@@ -210,13 +211,16 @@ def train_model(dataset='mnist',
             break
         loss_train, acc_train = train_epoch(model, loader_train, loss_func, 
                                             optimizer, device)
-        loss_val, acc_val = predict_epoch(model, loader_val, loss_func, device)
+        loss_val, acc_val = predict_epoch(model, loader_val, loss_func, device=device)
             
-        print('Epoch [{}/{}], Train Loss: {:.4f}, Train Acc: {:.2f}, Val Loss: {:.4f}, Val Acc: {:.2f}' 
-               .format(i+1, epochs, loss_train, acc_train, loss_val, acc_val))
+        line = 'Epoch [{}/{}], Train Loss: {:.4f}, Train Acc: {:.2f}, Val Loss: {:.4f}, Val Acc: {:.2f}'.format(i+1, epochs, loss_train, acc_train, loss_val, acc_val)
+        print(line)
+        update_trainlog(dataset, architecture, index, dropout, line)
         # save current model if it shows lowest val loss in history
         if save and (i == 0 or loss_val < loss_val_min):
-            print('Saving model')
+            line = 'Saving model'
+            print(line)
+            update_trainlog(dataset, architecture, index, dropout, line)
             loss_val_min = loss_val
             torch.save(model.state_dict(), pt)
             idx_epoch_saved = i
@@ -278,7 +282,7 @@ def attack_model(dataset: str = 'mnist',
     print('Attacking', dataset, architecture, index, dropout_train, dropout_test, 
           method, epsilon, subset, proportion)
     model = load_model(dataset, architecture, index, dropout_train, dropout_test,
-                       device, PARRALEL)
+                       device, MULTIGPU)
     x_attacked = []
 
     # attack CNN
@@ -377,7 +381,7 @@ def save_output(dataset: str = 'mnist',
                         method, epsilon, subset, proportion, batch_size, num_workers)
 
     model = load_model(dataset, architecture, index, dropout_train, dropout_test,
-                       device, PARRALEL)
+                       device, MULTIGPU)
     output = []
     for i in range(repeat):
         output.append(predict_epoch(model, loader, return_output=True, device=device))
@@ -530,18 +534,19 @@ def save_bayes(dataset: str = 'mnist',
     return acc, result
 
 
-def train_model_multiple(dataset='mnist', 
-                         architecture: str = 'cnn', 
-                         index: int = 0, 
-                         dropout: list = DROPOUT, 
-                         batch_size: int = 64, 
-                         epochs: int = 50, 
-                         save: bool = True, 
-                         patience: int = 20,
-                         device: list = list(range(len(DROPOUT))),
-                         num_workers: int = 4):
+def train_model_multidropout(dataset='mnist', 
+                             architecture: str = 'cnn', 
+                             index: int = 0, 
+                             dropout: list = DROPOUT, 
+                             batch_size: int = 64, 
+                             epochs: int = 50, 
+                             save: bool = True, 
+                             patience: int = 20,
+                             device: list = list(range(len(DROPOUT))),
+                             num_workers: int = 4):
     """
-    Train multiple models (on multiple GPUs simultaneously if available).
+    Train multiple models with multiple dropout rates 
+    (on multiple GPUs simultaneously if available).
 
     Parameters
     ----------
@@ -574,15 +579,39 @@ def train_model_multiple(dataset='mnist',
 
     """
     # train models on multiple GPUs simultaneously
-    if PARRALEL:
+    if MULTIGPU:
         if device is None:
             device = list(range(len(dropout)))
-        assert len(device) == DROPOUT, 'number of GPUs != number of dropout rates'
+        error = 'number of GPUs (%d) != number of dropout rates (%d)'%(len(device), len(dropout))
+        assert len(device) == len(dropout), error
         device = ['cuda:'+str(i) for i in device]
+        # TODO: only training progress of last model can be output
+        # it's ideal to show progress of all training
         # create a bash script to run multiple train_single_model.py simultaneously
-        pass
+        # the script be like:
+            # #!/bin/bash
+            # python train_single_model.py ... dropout 0 ... --device cuda:0 &
+            # python train_single_model.py ... dropout 0.2 ... --device cuda:1 &
+            # python train_single_model.py ... dropout 0.4 ... --device cuda:2
+        lines = ['#!/bin/bash\n']
+        for dr, de in zip(dropout, device):
+            l = 'python train_single_model.py '
+            arg_str = ['dataset', 'architecture', 'index', 'dropout', 'batch_size', 
+                       'epochs', 'save', 'patience', 'device', 'num_workers']
+            arg_str = ['--'+i+' ' for i in arg_str]
+            arg_arg = [dataset, architecture, index, dr, batch_size, epochs,
+                       save, patience, de, num_workers]
+            l += ' '.join([s+str(a) for s, a in zip(arg_str, arg_arg)]) + ' &\n'
+            lines.append(l)
+        # print training progress of last model in terminal
+        lines[-1] = l[:-3]
+        script = 'train_multiple_model.sh'
+        with open(script, 'w') as f:
+            f.writelines(lines)
         # run the bash script
+        subprocess.run(['bash', script])
         pass
+
     # train models on single GPU
     else:
         device = DEVICE
@@ -778,4 +807,6 @@ if __name__ == '__main__':
     # pipeline_multidropout(method='pgd', epsilon=0.3)
     # pipeline_multiepsilon()
     # pipeline_multiepsilon(dropout_train=0.2, dropout_test=0.6)
+    # MULTIGPU = True
+    train_model_multidropout(dropout=[0])
     print('Cost %.2f mins'%((time() - time0) / 60))
