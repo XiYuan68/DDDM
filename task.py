@@ -140,6 +140,7 @@ def get_loader(dataset: str = 'mnist',
                subset: str = 'test', 
                proportion: float = 1,
                batch_size: int = 64, 
+               num_workers: int = 4,
                shuffle: bool = False):
     """
     Return pytorch data loader.
@@ -168,6 +169,8 @@ def get_loader(dataset: str = 'mnist',
         batch size. The default is 64.
     shuffle : bool, optional
         whether return data in random order. The default is False.
+    num_workers: int, optional
+        how many subprocesses to use for data. The default is 4.
 
     Returns
     -------
@@ -177,7 +180,7 @@ def get_loader(dataset: str = 'mnist',
     """
 
     d = get_dataset(dataset, subset, proportion)
-    # load generated adversarial samples
+    # load adversarial samples
     if method != 'clean':
         x = load_attack(dataset, 
                         architecture,
@@ -191,7 +194,7 @@ def get_loader(dataset: str = 'mnist',
         y = d.targets
         d = CustomDataset(x, y, None)
         
-    loader = DataLoader(d, batch_size, shuffle, num_workers=8, )
+    loader = DataLoader(d, batch_size, shuffle, num_workers=num_workers)
     
     return loader
 
