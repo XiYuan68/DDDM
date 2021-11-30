@@ -14,16 +14,15 @@ import subprocess
 import torch
 import numpy as np
 from scipy.special import softmax
-from joblib import Parallel, delayed
 
 from foolbox import PyTorchModel
-from foolbox.attacks import FGSM
 from foolbox.attacks import PGD
-from foolbox.attacks import L2CarliniWagnerAttack as CWL2
 import eagerpy as ep
 
-from task import get_loader, get_trial, get_output_of_category, load_likelihood
-from model import MNISTCNN, load_model, get_likelihood, bayesian_inference
+from task import (get_loader, get_trial, get_output_of_category, load_likelihood,
+                  DATASET_VISION, DATASET_TEXT)
+from model import (MNISTCNN, IMDBLSTM, CIFAR10RESNET, load_model, get_likelihood, 
+                   bayesian_inference, cumsum_inference)
 from utils import get_pt_model, get_npz, update_trainlog
 
 
@@ -32,14 +31,51 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MULTIGPU = torch.cuda.device_count() > 1
 PROPORTION = 0.1
 DROPOUT = [0, 0.2, 0.4, 0.6, 0.8]
-METHOD = ['clean', 'pgd']
-METHOD_TITLE = ['Clean', 'PGD']
+
+METHOD_MNIST = ['clean', 'pgd']
 EPSILON_MNIST = [0, 0.3]
 EPSILON_MNIST_FIGURE = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
-EPSILON_CIFAR10 = [0, 0.03]
+
+METHOD_CIFAR10 = ['clean', 'pgd']
+EPSILON_CIFAR10 = [0, 0.031]
+EPSILON_CIFAR10_FIGURE = [0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05]
+
+METHOD_IMDB = ['clean', 'textbugger']
+EPSILON_IMDB = [0, 0]
+
+METHOD_TITLE = {'clean': 'Clean', 'pgd': 'PGD', 'textbugger': 'TextBugger'}
 
 
-def train_epoch(model: torch.nn.Module, 
+class AccuracyGetter:
+    def __init__(self, dataset: str, architecture: str):
+        if dataset == 'mnist' and architecture == 'cnn':
+            self.feature_dim = 1
+        elif dataset == 'imdb' and architecture == 'lstm':
+            self.feature_dim = -1   
+        elif dataset == 'cifar10' and architecture == 'resnet':
+            self.feature_dim = 1
+        else:
+            raise Exception('Wrong dataset and architecture combination: %s + %s'%(dataset, architecture))
+        self.n_sample = 0
+        self.n_correct = 0
+
+    def compute_batch(self, output: torch.Tensor, y: torch.Tensor):
+        # RNN return sequence instead of single label
+        if output.ndim > 2:
+            output = torch.mean(output, dim=1)
+        self.n_sample += y.shape[0]
+        _, predicted = torch.max(output, self.feature_dim)
+        self.n_correct += (predicted == y).sum().item()
+
+    def get_accuracy(self):
+        acc = self.n_correct / self.n_sample
+        
+        return acc
+
+
+def train_epoch(dataset: str,
+                architecture: str, 
+                model: torch.nn.Module, 
                 loader: torch.utils.data.DataLoader, 
                 loss_func: torch.nn.modules.loss._Loss, 
                 optimizer: torch.optim.Optimizer,
@@ -69,8 +105,7 @@ def train_epoch(model: torch.nn.Module,
 
     """
     model.train()
-    n_train = loader.dataset.__len__()
-    n_train_correct = 0
+    acc_getter = AccuracyGetter(dataset, architecture)
     loss_train = []
 
     for x, y in loader:
@@ -81,20 +116,21 @@ def train_epoch(model: torch.nn.Module,
         loss.backward()
         optimizer.step()
         loss_train.append(loss.item())
-        _, predicted = torch.max(output, 1)
-        n_train_correct += (predicted == y).sum().item()
+        acc_getter.compute_batch(output, y)
 
     loss_train = np.mean(loss_train)
-    acc_train = n_train_correct / n_train
+    acc_train = acc_getter.get_accuracy()
 
     return loss_train, acc_train
 
 
-def predict_epoch(model: torch.nn.Module, 
+def predict_epoch(dataset: str,
+                  architecture: str, 
+                  model: torch.nn.Module, 
                   loader: torch.utils.data.DataLoader, 
                   loss_func: torch.nn.modules.loss._Loss = None, 
                   return_output: bool = False,
-                  device: str = DEVICE):
+                  device: torch.device = DEVICE):
     """
     Let given neural network make predicitons.
 
@@ -119,9 +155,9 @@ def predict_epoch(model: torch.nn.Module,
         DESCRIPTION.
 
     """
+    
     model.eval()
-    n_sample = loader.dataset.__len__()
-    n_correct = 0
+    acc_getter = AccuracyGetter(dataset, architecture)
     loss_all = []
     output_all = []
     for x, y in loader:
@@ -135,10 +171,10 @@ def predict_epoch(model: torch.nn.Module,
         if loss_func is not None:
             loss = loss_func(output, y)
             loss_all.append(loss.item())
-        _, predicted = torch.max(output, 1)
-        n_correct += (predicted == y).sum().item()
+        acc_getter.compute_batch(output, y)
+
     loss_mean = np.mean(loss_all)
-    acc = n_correct / n_sample
+    acc = acc_getter.get_accuracy()
     
     if return_output:
         output_all = np.concatenate(output_all, -2)
@@ -155,7 +191,7 @@ def train_model(dataset='mnist',
                 epochs: int = 50, 
                 save: bool = True, 
                 patience: int = 20,
-                device: str = DEVICE,
+                device: torch.device = DEVICE,
                 num_workers: int = 4):
     """
     Train a neural network.
@@ -192,13 +228,24 @@ def train_model(dataset='mnist',
     """
 
     print('Training', dataset, architecture, index, dropout)
+    
     update_trainlog(dataset, architecture, index, dropout, mode='w')
     if dataset == 'mnist' and architecture == 'cnn':
         model = MNISTCNN(dropout).to(device)
+    elif dataset == 'imdb' and architecture == 'lstm':
+        model = IMDBLSTM(dropout=dropout).to(device)
+    elif dataset == 'cifar10' and architecture == 'resnet':
+        # https://github.com/akamaster/pytorch_resnet_cifar10/raw/master/pretrained_models/resnet20-12fca82f.th
+        th = 'data/cifar10/others/resnet20-12fca82f.th'
+        model = CIFAR10RESNET(dropout, th).to(device)
+    else:
+        raise Exception('Wrong dataset and architecture combination: %s + %s'%(dataset, architecture))
     loss_func = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters())
+    
     loader_train = get_loader(dataset, subset='train', batch_size=batch_size,
-                              shuffle=True, num_workers=num_workers)
+                              shuffle=True, num_workers=num_workers, 
+                              phase='training')
     loader_val = get_loader(dataset, subset='val', batch_size=batch_size, 
                             num_workers=num_workers)
     pt = get_pt_model(dataset, architecture, index, dropout)
@@ -209,9 +256,12 @@ def train_model(dataset='mnist',
         if i > idx_epoch_saved + patience:
             print('Early Stopping')
             break
-        loss_train, acc_train = train_epoch(model, loader_train, loss_func, 
+        loss_train, acc_train = train_epoch(dataset, architecture, 
+                                            model, loader_train, loss_func, 
                                             optimizer, device)
-        loss_val, acc_val = predict_epoch(model, loader_val, loss_func, device=device)
+        loss_val, acc_val = predict_epoch(dataset, architecture, 
+                                          model, loader_val, loss_func, 
+                                          device=device)
             
         line = 'Epoch [{}/{}], Train Loss: {:.4f}, Train Acc: {:.2f}, Val Loss: {:.4f}, Val Acc: {:.2f}'.format(i+1, epochs, loss_train, acc_train, loss_val, acc_val)
         print(line)
@@ -239,7 +289,7 @@ def attack_model(dataset: str = 'mnist',
                  proportion: float = PROPORTION, 
                  batch_size: int = 512, 
                  save: bool = True,
-                 device: str = DEVICE,
+                 device: torch.device = DEVICE,
                  num_workers: int = 4):
     """
     Attack neural network if method!='clean'.
@@ -281,28 +331,42 @@ def attack_model(dataset: str = 'mnist',
     """
     print('Attacking', dataset, architecture, index, dropout_train, dropout_test, 
           method, epsilon, subset, proportion)
+    if dataset in DATASET_TEXT and method != 'clean':
+        print('Skipping')
+        return 0
+        
+    
     model = load_model(dataset, architecture, index, dropout_train, dropout_test,
                        device, MULTIGPU)
     x_attacked = []
 
-    # attack CNN
-    if architecture == 'cnn':
-        loader = get_loader(dataset, subset=subset, proportion=proportion, 
-                            batch_size=batch_size, num_workers=num_workers)
+    phase = None if method == 'clean' else 'attacking'
+    loader = get_loader(dataset, subset=subset, proportion=proportion, 
+                        batch_size=batch_size, num_workers=num_workers, 
+                        phase=phase)
+        
         
     # no attacks, clean evaluation
     if method == 'clean':
-        acc = predict_epoch(model, loader, device=device)[-1]
+        acc = predict_epoch(dataset, architecture, model, loader, device=device)[-1]
     
     # attack model
     else:
-        fmodel = PyTorchModel(model, bounds=(0,1))
-        if method == 'fgsm':
-            attack = FGSM()
-        elif method == 'pgd':
-            attack = PGD()
-        elif method == 'cwl2':
-            attack = CWL2()
+        if dataset == 'mnist':
+            preprocessing = None
+            if method == 'pgd':
+                attack = PGD()
+        elif dataset == 'cifar10':
+            preprocessing = dict(mean=[0.485, 0.456, 0.406],
+                                  std=[0.229, 0.224, 0.225],
+                                  axis=-3)
+            if method == 'pgd':
+                # attack = PGD(rel_stepsize=0.01/epsilon, steps=200)
+                attack = PGD()
+        else:
+            raise Exception('Wrong dataset: %s'%dataset)
+        fmodel = PyTorchModel(model, bounds=(0,1), preprocessing=preprocessing)
+
 
         if_attacked = []
         for x, y in loader:
@@ -335,7 +399,7 @@ def save_output(dataset: str = 'mnist',
                 proportion: float = PROPORTION, 
                 repeat: int = 100,
                 batch_size: int = 1024,
-                device: str = DEVICE,
+                device: torch.device = DEVICE,
                 num_workers: int = 4):
     """
     Save neural network output.
@@ -377,19 +441,24 @@ def save_output(dataset: str = 'mnist',
     """
     print('Saving Output', dataset, architecture, index, dropout_train, dropout_test, 
           method, epsilon, subset, proportion, repeat)
+    
     loader = get_loader(dataset, architecture, index, dropout_train, dropout_test,
                         method, epsilon, subset, proportion, batch_size, num_workers)
 
     model = load_model(dataset, architecture, index, dropout_train, dropout_test,
                        device, MULTIGPU)
-    output = []
-    for i in range(repeat):
-        output.append(predict_epoch(model, loader, return_output=True, device=device))
-    output = softmax(np.stack(output, axis=0), axis=-1)
 
+    output = []
+    # print(predict_epoch(dataset, architecture, model, loader, device=device))
+    for i in range(repeat):
+        output.append(predict_epoch(dataset, architecture, model, loader, 
+                                    return_output=True, device=device))
+    output_raw = np.stack(output, axis=0)
+    output = softmax(output_raw, axis=-1)
+        
     npz = get_npz('output', dataset, architecture, index, dropout_train, 
                   dropout_test, method, epsilon, subset, proportion, repeat)
-    np.savez_compressed(npz, output=output)
+    np.savez_compressed(npz, output=output, output_raw=output_raw)
     
     return output
     
@@ -399,8 +468,8 @@ def save_likelihood(dataset: str = 'mnist',
                     index: int = 0, 
                     dropout_train: float = 0, 
                     dropout_test: float = 0, 
-                    method: str = 'clean', 
-                    epsilon: float = 0, 
+                    method: list = ['clean', 'pgd'], 
+                    epsilon: list = [0, 0.3], 
                     subset: str = 'train', 
                     proportion: float = PROPORTION, 
                     repeat: int = 10,
@@ -420,10 +489,10 @@ def save_likelihood(dataset: str = 'mnist',
         dropout rate at training phase. The default is 0.
     dropout_test : float, optional
         dropout rate at test phase. The default is 0.
-    method : str, optional
-        adversarial attack method. The default is 'clean'.
-    epsilon : float, optional
-        perturbation threshold of attacks. The default is 0.
+    method : list, optional
+        attack methods. The default is ['clean', 'pgd'].
+    epsilon : list, optional
+        perturbation threshold of attacks. The default is [0, 0.3].
     subset : str, optional
         subset of dataset. The default is 'train'.
     proportion : float, optional
@@ -441,33 +510,44 @@ def save_likelihood(dataset: str = 'mnist',
     """
     print('Saving Likelihood', dataset, architecture, index, dropout_train, 
           dropout_test, method, epsilon, subset, proportion, repeat, n_channel)
+    output_of_category_permethod = []
+    for m, e in zip(method, epsilon):
+        args = [dataset, architecture, index, dropout_train, dropout_test, 
+                m, e, subset, proportion, repeat]
+        output_of_category_permethod.append(get_output_of_category(*args))
+    output_of_category = []
+    n_choice = len(output_of_category_permethod[0])
+    for i in range(n_choice):
+        output_of_category.append(np.concatenate([j[i] for j in output_of_category_permethod]))
+    likelihood = get_likelihood(output_of_category, n_channel)
     args = [dataset, architecture, index, dropout_train, dropout_test, 
             method, epsilon, subset, proportion, repeat]
-    output_of_category = get_output_of_category(*args)
-    likelihood = get_likelihood(output_of_category, n_channel)
     npz = get_npz(*(['likelihood'] + args + [n_channel]))
     np.savez_compressed(npz, likelihood=likelihood)
 
     return likelihood
 
 
-def save_bayes(dataset: str = 'mnist', 
-               architecture: str = 'cnn',
-               index: int = 0, 
-               dropout_train: float = 0, 
-               dropout_test: float = 0, 
-               method: str = 'clean', 
-               epsilon: float = 0, 
-               subset: str = 'test', 
-               proportion: float = PROPORTION, 
-               repeat: int = 100,
-               len_trial: int = 25, 
-               n_trial: int = 10, 
-               boundary: float = 0.99, 
-               n_channel: int = 3,
-               repeat_train: int = 10): 
+def save_inference(dataset: str = 'mnist', 
+                   architecture: str = 'cnn',
+                   index: int = 0, 
+                   dropout_train: float = 0, 
+                   dropout_test: float = 0, 
+                   method: str = 'clean', 
+                   epsilon: float = 0, 
+                   subset: str = 'test', 
+                   proportion: float = PROPORTION, 
+                   repeat: int = 100,
+                   len_trial: int = 25, 
+                   n_trial: int = 10, 
+                   inference: str = 'bayes',
+                   boundary: float = 0.99,
+                   n_channel: int = 3,
+                   repeat_train: int = 10,
+                   likelihood_method: list = ['clean', 'pgd'],
+                   likelihood_epsilon: list = [0, 0.3]): 
     """
-    Save bayesian inference results.
+    Save cumsum/bayesian inference results.
 
     Parameters
     ----------
@@ -495,12 +575,25 @@ def save_bayes(dataset: str = 'mnist',
         length of each trial. The default is 25.
     n_trial : int, optional
         number of trials for each sample. The default is 10.
+    inference : str, optional
+        type of inference to perform, choose from ['cumsum' | 'bayes']. 
+        The default is 'bayes'.
     boundary : float, optional
-        posterior belief decision boundary. The default is 0.99.
+        decision evidence boundary. The default is 0.99.
     n_channel : int, optional
-        number of channel for likelihood estimation. The default is 3.
+        number of channel for likelihood estimation, only for bayes inference. 
+        The default is 3.
     repeat_train : int, optional
-        number of neural network prediction of each training set sample. The default is 10.
+        number of neural network prediction of each training set sample to 
+        estimate likelihood, only for bayes inference.
+        The default is 10.
+    likelihood_method : list, optional
+        strings of attack methods for likelihood estimation, only for bayes inference. 
+        The default is ['clean', 'pgd'].
+    likelihood_epsilon : list, optional
+        floats of attack epsilons for likelihood estimation, only for bayes inference. 
+        The default is [0, 0.3].
+        
 
     Returns
     -------
@@ -511,24 +604,32 @@ def save_bayes(dataset: str = 'mnist',
 
     """
     # TODO: low acc, posterior belief rises too fast (1-2 step)
-    print('Saving Bayes', dataset, architecture, index, dropout_train, dropout_test,
-          method, epsilon, subset, repeat, len_trial, n_trial, boundary)
+    print('Saving', inference, dataset, architecture, index, dropout_train, 
+          dropout_test, method, epsilon, subset, repeat, len_trial, n_trial, 
+          boundary, )
     args = [dataset, architecture, index, dropout_train, dropout_test, method, epsilon]
 
     args_trial = args + [subset, proportion, repeat, len_trial, n_trial]
     trial, y = get_trial(*args_trial)
 
-    args_likelihood = args + ['train', proportion, repeat_train, n_channel]
-    likelihood = load_likelihood(*args_likelihood)
+    args_npz = args + [subset, proportion, repeat, len_trial, n_trial, boundary]
+    if inference == 'bayes':
+        args_likelihood = [dataset, architecture, index, dropout_train, dropout_test]
+        args_likelihood += [likelihood_method, likelihood_epsilon, 'train', 
+                            proportion, repeat_train, n_channel]
+        likelihood = load_likelihood(*args_likelihood)
+        result = bayesian_inference(trial, boundary, likelihood, n_channel)
+        args_npz += [n_channel, likelihood_method, likelihood_epsilon]
+    elif inference == 'cumsum':
+        result = cumsum_inference(trial, boundary)
+    else:
+        raise Exception("Invalid inference: %s"%inference)
 
-    result = bayesian_inference(trial, boundary, likelihood, n_channel)
-    belief_post, response_time, choice = result
+    response_time, choice, evidence = result
     acc = np.mean(y == choice)
     print('Acc: %f'%acc)
-
-    args_npz = args + [subset, proportion, repeat, len_trial, n_trial, boundary, n_channel]
-    npz = get_npz('bayes',  *args_npz)
-    np.savez_compressed(npz, acc=[acc], belief_post=belief_post,
+    npz = get_npz(inference,  *args_npz)
+    np.savez_compressed(npz, acc=[acc], evidence=evidence,
                         response_time=response_time, choice=choice)
     
     return acc, result
@@ -614,31 +715,36 @@ def train_model_multidropout(dataset='mnist',
 
     # train models on single GPU
     else:
-        device = DEVICE
+        device = 'cuda'
         for i in dropout:
             train_model(dataset, architecture, index, i, batch_size, epochs,
                         save, patience, device, num_workers)
 
 
-def pipeline_multidropout(dataset: str = 'mnist', 
-                          architecture: str = 'cnn',
-                          index: int = 0, 
-                          dropout: list = DROPOUT, 
-                          method: str = 'clean', 
-                          epsilon: float = 0, 
-                          proportion_train: float = PROPORTION, 
-                          repeat_train: int = 10,
-                          proportion_test: float = PROPORTION,
-                          repeat_test: int = 100,
-                          len_trial: int = 25, 
-                          n_trial: int = 10, 
-                          boundary: float = 0.99, 
-                          n_channel: int = 3,
-                          batch_size: int = 512,
-                          device: str = DEVICE,
-                          num_workers: int = 4):
+def pipeline(dataset: str = 'mnist', 
+             architecture: str = 'cnn',
+             index: int = 0, 
+             dropout_train: float = 0, 
+             dropout_test: float = 0,
+             method: str = 'clean', 
+             epsilon: float = 0, 
+             proportion_train: float = PROPORTION, 
+             repeat_train: int = 10,
+             proportion_test: float = PROPORTION,
+             repeat_test: int = 100,
+             len_trial: int = 25, 
+             n_trial: int = 10, 
+             boundary_cumsum: float = 5, 
+             boundary_bayes: float = 0.99, 
+             n_channel: int = 3,
+             batch_size: int = 512,
+             device: torch.device = DEVICE,
+             num_workers: int = 4,
+             likelihood_method: list = ['clean'],
+             likelihood_epsilon: list = [0]):
     """
-    Convenient function to attack neural networks of multiple dropout rates.
+    Convenient function to attack neural networks, estimate likelihood and 
+    perform cumsum and bayesian inference.
 
     Parameters
     ----------
@@ -658,16 +764,18 @@ def pipeline_multidropout(dataset: str = 'mnist',
     proportion_train : float, optional
         proportion of training set. The default is 1.
     repeat_train : int, optional
-        output repeat of training set. The default is 10.
+        prediction repeat of training set. The default is 10.
     proportion_test : float, optional
         proportion of test set. The default is 1.
     repeat_test : int, optional
-        output repeat of test set. The default is 100.
+        prediction repeat of test set. The default is 100.
     len_trial : int, optional
         length of each trial. The default is 25.
     n_trial : int, optional
         number of trials for each sample. The default is 10.
-    boundary : float, optional
+    boundary_cumsum : float, optional
+        neural network prediction decision boundary. The default is 5.
+    boundary_bayes : float, optional
         posterior belief decision boundary. The default is 0.99.
     n_channel : int, optional
         number of channel for likelihood estimation. The default is 3.
@@ -678,135 +786,76 @@ def pipeline_multidropout(dataset: str = 'mnist',
     num_workers: int, optional
         how many subprocesses to use for data. The default is 4.
 
-    Returns
-    -------
-    None.
-
     """
-    # spr stands for subset, proportion, repeat
+    
     spr = [['train', 'test'], 
            [proportion_train, proportion_test], 
            [repeat_train, repeat_test]]
 
-    args_likelihood = []
-    args_bayes = []
-    for i in dropout:
-        for j in dropout:
-            for s, p, r in zip(*spr):
-                attack_model(dataset, architecture, index, i, j, method, epsilon,
-                              s, p, batch_size, device, num_workers)
-                save_output(dataset, architecture, index, i, j, method, epsilon,
-                            s, p, r, batch_size, device, num_workers)
-            
-            args_likelihood.append([dataset, architecture, index, i, j, method, 
-                                    epsilon, 'train', proportion_train, repeat_train, 
-                                    n_channel])
-            args_bayes.append([dataset, architecture, index, i, j, method, epsilon,
-                                'test', proportion_test, repeat_test, len_trial, 
-                                n_trial, boundary, n_channel, repeat_train])
-    print('likelihood')
-    Parallel(-1)(delayed(save_likelihood)(*i) for i in args_likelihood)
-    print('bayes')
-    Parallel(-1)(delayed(save_bayes)(*i) for i in args_bayes)
-
-
-def pipeline_multiepsilon(dataset: str = 'mnist', 
-                          architecture: str = 'cnn',
-                          index: int = 0, 
-                          dropout_train: float = 0, 
-                          dropout_test: float = 0, 
-                          method: str = 'pgd', 
-                          epsilon: list = EPSILON_MNIST_FIGURE, 
-                          subset: str = 'test', 
-                          proportion_train: float = PROPORTION, 
-                          repeat_train: int = 10,
-                          proportion_test: float = PROPORTION,
-                          repeat_test: int = 100,
-                          len_trial: int = 25, 
-                          n_trial: int = 10, 
-                          boundary: float = 0.99, 
-                          n_channel: int = 3,
-                          batch_size: int = 512,
-                          device: str = DEVICE,
-                          num_workers: int = 4):
-    """
-    Convenient function to attack neural networks with multiple epsilons.
-
-    Parameters
-    ----------
-    dataset : str, optional
-        name of dataset. The default is 'mnist'.
-    architecture : str, optional
-        architecture of the neural network. The default is 'cnn'.
-    index : int, optional
-        index of data to return. The default is 0.
-    dropout_train : float, optional
-        dropout rate at training phase. The default is 0.
-    dropout_test : float, optional
-        dropout rate at test phase. The default is 0.
-    method : str, optional
-        adversarial attack method. The default is 'pgd'.
-    epsilon : list, optional
-        perturbation thresholds of attack. The default is EPSILON_FIGURE.
-    subset : str, optional
-        subset of dataset. The default is 'test'.
-    proportion : float, optional
-        proportion of subset data. The default is PROPORTION.
-    repeat : int, optional
-        number of neural network prediction of each sample. The default is 100.
-    len_trial : int, optional
-        length of each trial. The default is 25.
-    n_trial : int, optional
-        number of trials for each sample. The default is 10.
-    boundary : float, optional
-        posterior belief decision boundary. The default is 0.99.
-    n_channel : int, optional
-        number of channel for likelihood estimation. The default is 3.
-    batch_size : int, optional
-        batch size. The default is 512.
-    device : str, optional
-        device on which the model is loaded. The default is DEVICE.
-    num_workers: int, optional
-        how many subprocesses to use for data. The default is 4.
-
-    Returns
-    -------
-    None.
-
-    """
-    # spr stands for subset, proportion, repeat
-    spr = [['train', 'test'], 
-           [proportion_train, proportion_test], 
-           [repeat_train, repeat_test]]
-
-    args_likelihood = []
-    args_bayes = []
-    for i in epsilon:
-        for s, p, r in zip(*spr):
-            attack_model(dataset, architecture, index, dropout_train, dropout_test, 
-                          method, i, s, p, batch_size, device, num_workers)
-            save_output(dataset, architecture, index, dropout_train, dropout_test, 
-                        method, i, s, p, r, batch_size, device, num_workers)
-        args_likelihood.append([dataset, architecture, index, dropout_train, 
-                                dropout_test, method, i, 'train', proportion_train, 
-                                repeat_train, n_channel])
-        args_bayes.append([dataset, architecture, index, dropout_train, dropout_test, 
-                           method, i, 'test', proportion_test, repeat_test, len_trial, 
-                           n_trial, boundary, n_channel, repeat_train])
-    Parallel(-1)(delayed(save_likelihood)(*i) for i in args_likelihood)
-    Parallel(-1)(delayed(save_bayes)(*i) for i in args_bayes)
-    pass
+    for s, p, r in zip(*spr):
+        attack_model(dataset, architecture, index, dropout_train, dropout_test, 
+                        method, epsilon, s, p, batch_size, True, device, num_workers)
+        save_output(dataset, architecture, index, dropout_train, dropout_test, 
+                    method, epsilon, s, p, r, batch_size, device, num_workers)
+    
+    save_inference(dataset, architecture, index, dropout_train, dropout_test, 
+                    method, epsilon, 'test', proportion_test, repeat_test, 
+                    len_trial, n_trial, 'cumsum', boundary_cumsum)
+    save_likelihood(dataset, architecture, index, dropout_train, dropout_test, 
+                    likelihood_method, likelihood_epsilon, 'train', 
+                    proportion_train, repeat_train, n_channel)
+    save_inference(dataset, architecture, index, dropout_train, dropout_test, 
+                    method, epsilon, 'test', proportion_test, repeat_test, 
+                    len_trial, n_trial, 'bayes', boundary_bayes, n_channel, 
+                    repeat_train, likelihood_method, likelihood_epsilon)
 
     
 
 if __name__ == '__main__':
     time0 = time()
+    dataset = 'mnist'
+    architecture = 'cnn'
+    index = 0
+    proportion_train = 0.1
+    proportion_test = 0.1
+    batch_size = 512
+    n_channel = 3
+    args = []
+    # save_output(dataset, architecture, index, 0.4, 0.6, 'pgd', 0.031, )
+    # save_inference(dataset, architecture, index, 0.4, 0.6, 'pgd', 0.031, 
+    #                inference='cumsum', boundary=5)
+
+    # pipeline(dataset, architecture, index, 0.4, 0.6, 'pgd', 0.031, 
+    #           proportion_train=proportion_train, 
+    #           proportion_test=proportion_test,
+    #           n_channel=n_channel,
+    #           batch_size=batch_size,
+    #           likelihood_method=['clean', 'pgd'], 
+    #           likelihood_epsilon=[0, 0.031])
+    train_model(dataset, architecture, index, dropout=0.8, batch_size=128, save=False)
+    # train_model(dataset, architecture, index, dropout=0.2, batch_size=128)
+    # train_model(dataset, architecture, index, dropout=0.6, batch_size=128)
+    # attack_model(dataset, architecture, index, method='pgd', epsilon=0.031)
+    
     # for i in DROPOUT:
-        # train_model(dropout=i)
-    # pipeline_multidropout()
-    # pipeline_multidropout(method='pgd', epsilon=0.3)
-    # pipeline_multiepsilon()
-    # pipeline_multiepsilon(dropout_train=0.2, dropout_test=0.6)
-    # MULTIGPU = True
-    train_model_multidropout(dropout=[0])
+    #     for j in DROPOUT:
+    #         for m, e in zip(METHOD_CIFAR10, EPSILON_CIFAR10):
+    #             lm = ['clean', 'pgd']
+    #             le = [0, 0.031]
+    #             pipeline(dataset, architecture, index, i, j, m, e, 
+    #                       proportion_train=proportion_train, 
+    #                       proportion_test=proportion_test,
+    #                       n_channel=n_channel,
+    #                       batch_size=batch_size,
+    #                       likelihood_method=lm, 
+    #                       likelihood_epsilon=le)
+    # i = 0.2
+    # j = 0.6
+    # m = 'pgd'
+    # for e in EPSILON_MNIST_FIGURE:
+    #     # attack_model(dataset, architecture, index, method='pgd', epsilon=e)
+    #     pipeline(dataset, architecture, index, i, j, m, e,
+    #               likelihood_method=['clean'], 
+    #               likelihood_epsilon=[0])
+
     print('Cost %.2f mins'%((time() - time0) / 60))
