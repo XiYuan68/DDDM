@@ -64,12 +64,15 @@ def mkdir_dataset(dataset: str = 'mnist'):
     None.
 
     """
-    print('Creating Directories for', dataset)
-    dir_dataset = 'data/'+dataset
-    mkdir(dir_dataset)
-    subdir = ['model', 'figure', 'attack', 'output', 'likelihood', 'bayes', 'others']
-    for i in subdir:
-        mkdir(get_dir(dataset, i))
+    path = listdir('data')
+    if dataset not in path:
+        print('Creating Directories for', dataset)
+        dir_dataset = 'data/'+dataset
+        mkdir(dir_dataset)
+        subdir = ['model', 'figure', 'attack', 'output', 'likelihood', 'bayes', 
+                  'others', 'cumsum']
+        for i in subdir:
+            mkdir(get_dir(dataset, i))
 
 
 def get_pt_model(dataset: str = 'mnist', 
@@ -346,7 +349,9 @@ def get_npz_bayes(dataset: str,
                   len_trial: int, 
                   n_trial: int, 
                   boundary: float, 
-                  n_channel: int):
+                  n_channel: int,
+                  likelihood_method: list,
+                  likelihood_epsilon: list):
     """
     Return path of `.npz` file that contains bayesian inference results.
 
@@ -387,9 +392,68 @@ def get_npz_bayes(dataset: str,
         path of `.npz` file.
 
     """
-    args = ['bayes', architecture, index, dropout_train, dropout_test, method, epsilon, 
-            subset, proportion, repeat, len_trial, n_trial, boundary, n_channel]
+    args = ['bayes', architecture, index, dropout_train, dropout_test, method, 
+            epsilon, subset, proportion, repeat, len_trial, n_trial, boundary, 
+            n_channel, likelihood_method, likelihood_epsilon]
     npz = args2npz(dataset, 'bayes', args)
+    return npz
+
+
+def get_npz_cumsum(dataset: str, 
+                   architecture: str, 
+                   index: int, 
+                   dropout_train: float, 
+                   dropout_test: float, 
+                   method: str, 
+                   epsilon: float, 
+                   subset: str, 
+                   proportion: float, 
+                   repeat: int, 
+                   len_trial: int, 
+                   n_trial: int, 
+                   boundary: float):
+    """
+    Return path of `.npz` file that contains bayesian inference results.
+
+    Parameters
+    ----------
+    dataset : str
+        name of dataset.
+    architecture : str
+        architecture of the neural network.
+    index : int
+        index of data to return.
+    dropout_train : float
+        dropout rate at training phase.
+    dropout_test : float
+        dropout rate at test phase.
+    method : str
+        adversarial attack method.
+    epsilon : float
+        perturbation threshold of attacks.
+    subset : str
+        subset of dataset.
+    proportion : float
+        proportion of subset data.
+    repeat : int
+        number of neural network prediction of each sample.
+    len_trial : int
+        length of each trial.
+    n_trial : int
+        number of trials for each sample.
+    boundary : float
+        posterior belief decision boundary.
+
+
+    Returns
+    -------
+    npz : str
+        path of `.npz` file.
+
+    """
+    args = ['cumsum', architecture, index, dropout_train, dropout_test, method, 
+            epsilon, subset, proportion, repeat, len_trial, n_trial, boundary]
+    npz = args2npz(dataset, 'cumsum', args)
     return npz
 
 
@@ -436,6 +500,5 @@ mkdir_databackup()
 
 
 if __name__ == '__main__':
-    # mkdir_dataset()
     backup_script()
     pass
