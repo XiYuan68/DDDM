@@ -10,15 +10,65 @@ prepare data for training and testing
 
 import numpy as np
 import torch
-from torchvision import datasets
-from torchvision.transforms import ToTensor
+from torchvision.datasets import MNIST, CIFAR10
+from torchvision.transforms import (ToTensor, Compose, Normalize, 
+                                    RandomHorizontalFlip, ToPILImage)
 from torch.utils.data import Dataset, DataLoader, random_split
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import GloVe
+from torchtext.datasets import IMDB
 
-from utils import get_npz, get_npz_output, get_npz_attack, get_npz_likelihood, get_npz_bayes
+from utils import (get_npz, get_npz_output, get_npz_attack, get_npz_likelihood, 
+                   get_npz_bayes, get_npz_cumsum, mkdir_dataset)
 
 
 # available name of dataset
-DATASET = ['mnist', 'cifar10']
+DATASET = ['mnist', 'cifar10', 'imdb']
+DATASET_VISION = ['mnist', 'cifar10']
+DATASET_TEXT = ['imdb']
+for i in DATASET:
+    mkdir_dataset(i)
+# directory containing dataset files
+DATASET_DIRECTORY = {'mnist': 'data', 'cifar10': 'data', 'imdb': 'data'}
+
+
+class TextToTensor:
+    """
+    Tokenize and vectorize strings.
+
+    Parameters
+    ----------
+    tokenizer : str, optional
+        name of tokenizer. The default is 'basic_english'.
+    glove_name : str, optional
+        version of glove word2vec. The default is '6B'.
+    glove_dim : int, optional
+        dims of converted vectors. The default is 300.
+    max_len : int, optional
+        number of tokens, strings will be padded or trunated if shorter or 
+        longer than this number. The default is 400.
+
+    Returns
+    -------
+    token vectors.
+
+    """
+    def __init__(self,
+                 tokenizer: str = 'basic_english',
+                 glove_name: str = '6B',
+                 glove_dim: int = 300,
+                 max_len: int = 400):
+
+        self.tokenizer = get_tokenizer(tokenizer)
+        self.vocab = GloVe(name=glove_name, dim=glove_dim)
+        self.max_len = max_len
+
+    def __call__(self, text):
+        x = self.tokenizer(text)
+        len_x = len(x)
+        x = x[:self.max_len] if len_x >= self.max_len else x + [''] * (self.max_len-len_x)
+        x = self.vocab.get_vecs_by_tokens(x)
+        return x
 
 
 class CustomDataset(Dataset):
@@ -31,15 +81,19 @@ class CustomDataset(Dataset):
         inputs for model.
     y : np.ndarray, shape as [n_sample]
         true labels in indexs.
-    transform : None, optional
-        transformation of x. The default is ToTensor().
+    transform_x : None, optional
+        transformation of x. The default is None.
 
     Returns
     -------
     None.
 
     """
-    def __init__(self, x: np.ndarray, y: np.ndarray, transform: None = ToTensor()):
+
+    def __init__(self,
+                 x: np.ndarray,
+                 y: np.ndarray,
+                 transform_x: None = None):
         """
         Instantiate a pytorch dataset with given x and y.
 
@@ -59,23 +113,50 @@ class CustomDataset(Dataset):
         """
         self.data = x
         self.targets = y
-        self.transform = transform
+        self.transform_x = transform_x
+
     def __len__(self):
-        return self.targets.shape[0]
+        return len(self.targets)
+
     def __getitem__(self, idx: int):
         x = self.data[idx]
-        if self.transform is not None:
-            x = self.transform(x)
+        if self.transform_x is not None:
+            x = self.transform_x(x)
         y = self.targets[idx]
-        
+
         return x, y
+
+
+def get_n_sample_dataset(dataset: str, torch_dataset: torch.utils.data.Dataset):
+    """
+    Return number of samples in given dataset.
+
+    Parameters
+    ----------
+    dataset : str
+        name of dataset.
+    torch_dataset : torch.utils.data.Dataset
+        torch dataset.
+
+    Returns
+    -------
+    n_sample : int
+        number of samples.
+
+    """
+    if dataset in DATASET_VISION:
+        n_sample = torch_dataset.data.shape[0]
+    elif dataset in DATASET_TEXT:
+        n_sample = torch_dataset.num_lines
+    return n_sample
 
 
 def get_dataset(dataset: str = 'mnist',
                 subset: str = 'test',
-                proportion: float = 1, 
+                proportion: float = 1,
                 validation_split: float = 0.2,
-                transform: None = ToTensor()):
+                transform: bool = True,
+                phase: str = None):
     """
     Return pytorch dataset.
 
@@ -89,8 +170,12 @@ def get_dataset(dataset: str = 'mnist',
         proportion of subset data. The default is 1.
     validation_split : float, optional
         split of original training set to be the validation set. The default is 0.2.
-    transform : None, optional
-        transformation of inputs. The default is ToTensor().
+    transform : bool, optional
+        whether apply transformation to inputs before feeding to model. 
+        The default is True.
+    phase : str, optional
+        ['training' | 'attacking' | None], for cifar10+renset only. 
+        The default is None.
 
     Returns
     -------
@@ -98,50 +183,88 @@ def get_dataset(dataset: str = 'mnist',
         pytorch dataset.
 
     """
-
+    dataset_directory = DATASET_DIRECTORY[dataset]
     generator = torch.Generator().manual_seed(0)
     if subset in ['train', 'val']:
         if dataset == 'mnist':
-            train_data = datasets.MNIST('data', True, ToTensor(), download=True)
+            train_data = MNIST(dataset_directory, True, ToTensor(), download=True)
         elif dataset == 'cifar10':
-            train_data = datasets.CIFAR10('data', True, ToTensor(), download=True)
+            train_data = CIFAR10(dataset_directory, True, ToTensor(), download=True)
+        elif dataset == 'imdb':
+            train_data = IMDB(root=dataset_directory, split='train')
         # split full training set into real training set and validation set
-        n_fulltrain = train_data.data.shape[0]
+        n_fulltrain = get_n_sample_dataset(dataset, train_data)
         n_val = int(n_fulltrain * validation_split)
         n_train = n_fulltrain - n_val
         lengths = [int(n_train * proportion), n_train - int(n_train * proportion),
                    int(n_val * proportion), n_val - int(n_val * proportion)]
         train_subset, _,  val_subset, _ = random_split(train_data, lengths,
                                                        generator=generator)
-        subset_return = train_subset if subset=='train' else val_subset
+        subset_return = train_subset if subset == 'train' else val_subset
     elif subset == 'test':
         if dataset == 'mnist':
-            test_data = datasets.MNIST('data', False, ToTensor(), download=True)
+            test_data = MNIST(dataset_directory, False, ToTensor(), download=True)
         elif dataset == 'cifar10':
-            test_data = datasets.CIFAR10('data', False, ToTensor(), download=True)
-        n_test = test_data.data.shape[0]
+            test_data = CIFAR10(dataset_directory, False, ToTensor(), download=True)
+        elif dataset == 'imdb':
+            test_data = IMDB(root=dataset_directory, split='test')
+        n_test = get_n_sample_dataset(dataset, test_data)
         lengths = [int(n_test * proportion), n_test - int(n_test * proportion)]
         subset_return, _ = random_split(test_data, lengths, generator)
-    
-    x = subset_return.dataset.data.numpy()[subset_return.indices]
-    y = subset_return.dataset.targets.numpy()[subset_return.indices]
-    dataset_return = CustomDataset(x, y, transform)
-    
+
+    if dataset in DATASET_VISION:
+        if dataset == 'mnist':
+            x = subset_return.dataset.data.numpy()[subset_return.indices]
+            y = subset_return.dataset.targets.numpy()[subset_return.indices]
+            transform_x = ToTensor() if transform else None
+        elif dataset == 'cifar10':
+            x = subset_return.dataset.data[subset_return.indices]
+            y = np.array(subset_return.dataset.targets)[subset_return.indices]
+            # these transform only suits resnet
+            if transform:
+                normalize = Normalize(mean=[0.485, 0.456, 0.406],
+                                      std=[0.229, 0.224, 0.225])
+                if phase == 'training':
+                    transform_x = Compose([ToPILImage(),
+                                           RandomHorizontalFlip(), 
+                                           ToTensor(), 
+                                           normalize])
+                elif phase == 'attacking':
+                    transform_x = Compose([ToPILImage(), ToTensor()])
+                else:
+                    transform_x = Compose([ToPILImage(), ToTensor(), normalize])
+            else:
+                transform_x = None
+        
+
+    elif dataset in DATASET_TEXT:
+        idx_subset = subset_return.indices
+        x, y = [], []
+        for idx, (iy, ix) in enumerate(subset_return.dataset):
+            if idx in idx_subset:
+                x.append(ix)
+                iy = 0 if iy == 'neg' else 1
+                y.append(iy)
+        transform_x = TextToTensor() if transform else None
+
+    dataset_return = CustomDataset(x, y, transform_x)
+
     return dataset_return
 
 
-def get_loader(dataset: str = 'mnist', 
-               architecture: str = 'cnn', 
-               index : int = 0, 
-               dropout_train: float = 0, 
+def get_loader(dataset: str = 'mnist',
+               architecture: str = 'cnn',
+               index: int = 0,
+               dropout_train: float = 0,
                dropout_test: float = 0,
-               method: str = 'clean', 
-               epsilon : float = 0,
-               subset: str = 'test', 
+               method: str = 'clean',
+               epsilon: float = 0,
+               subset: str = 'test',
                proportion: float = 1,
-               batch_size: int = 64, 
+               batch_size: int = 64,
                num_workers: int = 4,
-               shuffle: bool = False):
+               shuffle: bool = False, 
+               phase: str = None):
     """
     Return pytorch data loader.
 
@@ -167,10 +290,14 @@ def get_loader(dataset: str = 'mnist',
         proportion of subset data. The default is 1.
     batch_size : int, optional
         batch size. The default is 64.
-    shuffle : bool, optional
-        whether return data in random order. The default is False.
     num_workers: int, optional
         how many subprocesses to use for data. The default is 4.
+    shuffle : bool, optional
+        whether return data in random order. The default is False.
+    phase : str, optional
+        ['training' | 'attacking' | None], for cifar10+renset only. 
+        The default is None.
+        
 
     Returns
     -------
@@ -179,30 +306,38 @@ def get_loader(dataset: str = 'mnist',
 
     """
 
-    d = get_dataset(dataset, subset, proportion)
+    d = get_dataset(dataset, subset, proportion, phase=phase)
     # load adversarial samples
     if method != 'clean':
-        x = load_attack(dataset, 
+        if dataset in DATASET_TEXT:
+            transform = TextToTensor()
+        elif dataset == 'cifar10':
+            normalize = Normalize(mean=[0.485, 0.456, 0.406],
+                                  std=[0.229, 0.224, 0.225])
+            transform = Compose([lambda x: torch.tensor(x), normalize])
+        else:
+            transform = None
+        x = load_attack(dataset,
                         architecture,
-                        index, 
-                        dropout_train, 
+                        index,
+                        dropout_train,
                         dropout_test,
-                        method, 
-                        epsilon, 
-                        subset, 
+                        method,
+                        epsilon,
+                        subset,
                         proportion)
         y = d.targets
-        d = CustomDataset(x, y, None)
-        
+        d = CustomDataset(x, y, transform)
+
     loader = DataLoader(d, batch_size, shuffle, num_workers=num_workers)
-    
+
     return loader
 
 
-def get_tensor(dataset: str = 'mnist', 
-               subset: str = 'test', 
-               proportion: float = 1, 
-               onehot: bool = False):
+def get_y(dataset: str = 'mnist',
+          subset: str = 'test',
+          proportion: float = 1,
+          onehot: bool = False):
     """
     Return pytorch tensors of inputs and labels of dataset.
 
@@ -225,60 +360,31 @@ def get_tensor(dataset: str = 'mnist',
         labels.
 
     """
-    dataset_string = dataset
-    dataset = get_dataset(dataset, subset, proportion)
+    dataset_torch = get_dataset(dataset, subset, proportion)
 
-    x = dataset.data
-    x = x if isinstance(x, torch.Tensor) else torch.tensor(x)
-    y = dataset.targets
-    y = y if isinstance(y, torch.Tensor) else torch.tensor(y)
-    if dataset_string == 'mnist':
-        x = x[:, None]
+    y = dataset_torch.targets
+    if isinstance(y, np.ndarray):
+        pass
+    elif isinstance(y, torch.Tensor):
+        y = y.numpy()
+    elif isinstance(y, list):
+        y = np.array(y)
+    else:
+        raise Exception("Invalid type: %s"%str(type(y)))
     if onehot:
-        y = torch.eye(torch.max(y)+1)[y]
+        y = np.eye(np.max(y)+1)[y]
 
-    return x, y
+    return y
 
 
-def get_array(dataset: str = 'mnist', 
-              subset: str = 'test', 
-              proportion: float = 1, 
-              onehot: bool = False):
-    """
-    Return numpy arrays of inputs and labels of dataset.
-
-    Parameters
-    ----------
-    dataset : str, optional
-        name of dataset. The default is 'mnist'.
-    subset : str, optional
-        subset of dataset. The default is 'test'.
-    proportion : float, optional
-        proportion of subset data. The default is 1.
-    onehot : bool, optional
-        whether encode labels in the onehot manner. The default is False.
-
-    Returns
-    -------
-    x : np.ndarray, shape as [n_sample, *input_shape]
-        inputs.
-    y : np.ndarray, shape as [n_sample] or [n_sample, n_choice]
-        labels.
-
-    """
-    x, y = get_tensor(dataset, subset, proportion, onehot)
-    x, y = x.numpy(), y.numpy()
-    return x, y
-    
-
-def load_attack(dataset: str, 
-                architecture: str, 
-                index: int, 
-                dropout_train: float, 
-                dropout_test: float, 
-                method: str, 
-                epsilon: float, 
-                subset: str, 
+def load_attack(dataset: str,
+                architecture: str,
+                index: int,
+                dropout_train: float,
+                dropout_test: float,
+                method: str,
+                epsilon: float,
+                subset: str,
                 proportion: float):
     """
     Return saved adversarial samples.
@@ -310,22 +416,22 @@ def load_attack(dataset: str,
         adversarial samples.
 
     """
-    npz = get_npz_attack(dataset, architecture, index, dropout_train, dropout_test, 
+    npz = get_npz_attack(dataset, architecture, index, dropout_train, dropout_test,
                          method, epsilon, subset, proportion)
     with np.load(npz, allow_pickle=True) as data:
         x = data['x']
     return x
-        
+
 
 def load_output(dataset: str,
-                architecture: str, 
-                index: int, 
-                dropout_train: float, 
-                dropout_test: float, 
-                method: str, 
-                epsilon: float, 
-                subset: str, 
-                proportion: float, 
+                architecture: str,
+                index: int,
+                dropout_train: float,
+                dropout_test: float,
+                method: str,
+                epsilon: float,
+                subset: str,
+                proportion: float,
                 repeat: int):
     """
     Return saved outputs of neural networks.
@@ -359,24 +465,24 @@ def load_output(dataset: str,
         outputs of neural networks.
 
     """
-    npz = get_npz_output(dataset, architecture, index, dropout_train, dropout_test, 
+    npz = get_npz_output(dataset, architecture, index, dropout_train, dropout_test,
                          method, epsilon, subset, proportion, repeat)
     with np.load(npz, allow_pickle=True) as data:
         output = data['output']
-        
+
     return output
 
 
-def get_trial(dataset: str = 'mnist', 
-              architecture: str = 'cnn', 
-              index : int = 0, 
-              dropout_train: float = 0, 
+def get_trial(dataset: str = 'mnist',
+              architecture: str = 'cnn',
+              index: int = 0,
+              dropout_train: float = 0,
               dropout_test: float = 0,
-              method: str = 'clean', 
-              epsilon : float = 0,
-              subset: str = 'test', 
+              method: str = 'clean',
+              epsilon: float = 0,
+              subset: str = 'test',
               proportion: float = 1,
-              repeat: int = 100, 
+              repeat: int = 100,
               len_trial: int = 25,
               n_trial: int = 10):
     """
@@ -418,32 +524,32 @@ def get_trial(dataset: str = 'mnist',
 
     """
 
-    output = load_output(dataset, 
-                         architecture, 
-                         index, 
-                         dropout_train, 
-                         dropout_test, 
-                         method, 
-                         epsilon, 
-                         subset, 
-                         proportion, 
+    output = load_output(dataset,
+                         architecture,
+                         index,
+                         dropout_train,
+                         dropout_test,
+                         method,
+                         epsilon,
+                         subset,
+                         proportion,
                          repeat)
     n_repeat, n_sample, n_choice = output.shape
     idx_timestep = np.random.choice(n_repeat, [n_trial, len_trial])
     trial = np.concatenate(np.moveaxis(output[idx_timestep], -2, 0))
-    y = np.repeat(get_array(dataset, subset, proportion)[-1], n_trial)
+    y = np.repeat(get_y(dataset, subset, proportion), n_trial)
 
     return trial, y
 
 
-def get_output_of_category(dataset: str = 'mnist', 
-                           architecture: str = 'cnn', 
-                           index : int = 0, 
-                           dropout_train: float = 0, 
+def get_output_of_category(dataset: str = 'mnist',
+                           architecture: str = 'cnn',
+                           index: int = 0,
+                           dropout_train: float = 0,
                            dropout_test: float = 0,
-                           method: str = 'clean', 
-                           epsilon : float = 0,
-                           subset: str = 'test', 
+                           method: str = 'clean',
+                           epsilon: float = 0,
+                           subset: str = 'test',
                            proportion: float = 1,
                            repeat: int = 100):
     """
@@ -478,17 +584,17 @@ def get_output_of_category(dataset: str = 'mnist',
         neural network outputs of each category.
 
     """
-    output = load_output(dataset, 
+    output = load_output(dataset,
                          architecture,
-                         index, 
-                         dropout_train, 
-                         dropout_test, 
-                         method, 
-                         epsilon, 
-                         subset, 
-                         proportion, 
+                         index,
+                         dropout_train,
+                         dropout_test,
+                         method,
+                         epsilon,
+                         subset,
+                         proportion,
                          repeat)
-    y = get_array(dataset, subset, proportion)[-1]
+    y = get_y(dataset, subset, proportion)
     output_of_category = []
     for i in range(np.max(y)+1):
         idx = y == i
@@ -496,16 +602,16 @@ def get_output_of_category(dataset: str = 'mnist',
     return output_of_category
 
 
-def load_likelihood(dataset: str, 
+def load_likelihood(dataset: str,
                     architecture: str,
-                    index: int, 
-                    dropout_train: float, 
-                    dropout_test: float, 
-                    method: str, 
-                    epsilon: float, 
-                    subset: str, 
-                    proportion: float, 
-                    repeat: int, 
+                    index: int,
+                    dropout_train: float,
+                    dropout_test: float,
+                    method: str,
+                    epsilon: float,
+                    subset: str,
+                    proportion: float,
+                    repeat: int,
                     n_channel: int):
     """
     Return saved likelihood.
@@ -543,28 +649,30 @@ def load_likelihood(dataset: str,
         likelihood of each discretized output when input belongs to certain true label.
 
     """
-    npz = get_npz_likelihood(dataset, architecture, index, dropout_train, dropout_test, 
+    npz = get_npz_likelihood(dataset, architecture, index, dropout_train, dropout_test,
                              method, epsilon, subset, proportion, repeat, n_channel)
     with np.load(npz, allow_pickle=True) as data:
         likelihood = data['likelihood']
-        
+
     return likelihood
 
 
-def load_bayes(dataset: str, 
+def load_bayes(dataset: str,
                architecture: str,
-               index: int, 
-               dropout_train: float, 
-               dropout_test: float, 
-               method: str, 
-               epsilon: float, 
-               subset: str, 
-               proportion: float, 
-               repeat: int, 
-               len_trial: int, 
-               n_trial: int, 
-               boundary: float, 
-               n_channel: int):
+               index: int,
+               dropout_train: float,
+               dropout_test: float,
+               method: str,
+               epsilon: float,
+               subset: str,
+               proportion: float,
+               repeat: int,
+               len_trial: int,
+               n_trial: int,
+               boundary: float,
+               n_channel: int,
+               likelihood_method: list,
+               likelihood_epsilon: list):
     """
     Return saved bayesian inference results.
 
@@ -598,44 +706,48 @@ def load_bayes(dataset: str,
         posterior belief decision boundary.
     n_channel : int
         number of channel for likelihood estimation.
+    likelihood_method: list
+        strings of attack methods for likelihood estimation.
+    likelihood_epsilon: list
+        floats of attack epsilons for likelihood estimation.
 
     Returns
     -------
-    belief_post : np.ndarray, shape as [n_sample*n_trial, len_trial, n_choice]
-        all posterior probabilities through the process of bayesian inference.
     response_time : np.ndarray, shape as [n_sample*n_trial]
         number of timesteps needed to make the decision.
     choice : np.ndarray, shape as [n_sample*n_trial]
         final decisions made by bayesian inference.
+    evidence : np.ndarray, shape as [n_sample*n_trial, len_trial, n_choice]
+        all posterior probabilities through the process of bayesian inference.
 
     """
-    npz = get_npz_bayes(dataset, architecture, index, dropout_train, dropout_test, 
-                        method, epsilon, subset, proportion, repeat, len_trial, 
-                        n_trial, boundary, n_channel)
+    args = [dataset, architecture, index, dropout_train, dropout_test, method, 
+            epsilon, subset, proportion, repeat, len_trial, n_trial, boundary, 
+            n_channel, likelihood_method, likelihood_epsilon]
+    npz = get_npz_bayes(*args)
     with np.load(npz, allow_pickle=True) as data:
-        belief_post = data['belief_post']
+        evidence = data['evidence']
         response_time = data['response_time']
         choice = data['choice']
-    
-    return belief_post, response_time, choice
+
+    return response_time, choice, evidence
 
 
-def load_responsetime(dataset: str, 
-                      architecture: str,
-                      index: int, 
-                      dropout_train: float, 
-                      dropout_test: float, 
-                      method: str, 
-                      epsilon: float, 
-                      subset: str, 
-                      proportion: float, 
-                      repeat: int, 
-                      len_trial: int, 
-                      n_trial: int, 
-                      boundary: float, 
-                      n_channel: int):
+def load_cumsum(dataset: str,
+                architecture: str,
+                index: int,
+                dropout_train: float,
+                dropout_test: float,
+                method: str,
+                epsilon: float,
+                subset: str,
+                proportion: float,
+                repeat: int,
+                len_trial: int,
+                n_trial: int,
+                boundary: float,):
     """
-    Return response time in saved bayesian inference results.
+    Return saved Cumsum inference results.
 
     Parameters
     ----------
@@ -665,19 +777,27 @@ def load_responsetime(dataset: str,
         number of trials for each sample.
     boundary : float
         posterior belief decision boundary.
-    n_channel : int
-        number of channel for likelihood estimation.
 
     Returns
     -------
     response_time : np.ndarray, shape as [n_sample*n_trial]
         number of timesteps needed to make the decision.
+    choice : np.ndarray, shape as [n_sample*n_trial]
+        final decisions made by cumsum inference.
+    evidence : np.ndarray, shape as [n_sample*n_trial, len_trial, n_choice]
+        all summed prediciton through the process of cumsum inference.
 
     """
-    response_time = load_bayes(dataset, architecture, index, dropout_train, 
-                               dropout_test, method, epsilon, subset, proportion, 
-                               repeat, len_trial, n_trial, boundary, n_channel)[1]
-    return response_time
+    args = [dataset, architecture, index, dropout_train, dropout_test, method, 
+            epsilon, subset, proportion, repeat, len_trial, n_trial, boundary]
+    npz = get_npz_cumsum(*args)
+    with np.load(npz, allow_pickle=True) as data:
+        evidence = data['evidence']
+        response_time = data['response_time']
+        choice = data['choice']
+
+    return response_time, choice, evidence    
+    
 
 
 def load_acc(mode: str, *args: list):
@@ -704,4 +824,9 @@ def load_acc(mode: str, *args: list):
 
 
 if __name__ == '__main__':
+    ds = get_dataset('cifar10', proportion=0.5)
+    # dl = get_loader(dataset='imdb', proportion=0.5)
+    # for x, y in dl:
+    #     x = x.numpy()
+    #     y = y.numpy()
     pass
