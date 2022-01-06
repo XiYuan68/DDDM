@@ -30,3 +30,9 @@ This is the source code of our dropout-bayes-based classifier framework.
     - extract the downloaded file in `./data/`, so there will be a `DDDM/data/universal-sentence-encoder_4/saved_model.pb` after the extraction
     - now try running `nlp.attack_model_textattack()`
     
+- run `traintest.pipeline()` and `analysis.plot_heatmap()` to get heatmaps
+
+## Attacking Audio Models
+
+- run `attack_model_artasr()` after training the models
+- run `traintest.pipeline()` and `analysis.plot_heatmap()` to get heatmaps
