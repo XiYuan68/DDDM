@@ -18,7 +18,7 @@ from task import (get_output_of_category, load_acc, load_bayes, load_cumsum,
                   load_output, get_y)
 from traintest import (PROPORTION, DROPOUT, METHOD_MNIST, METHOD_TITLE, EPSILON_MNIST, 
                        EPSILON_MNIST_FIGURE, EPSILON_CIFAR10_FIGURE)
-from utils import get_dir
+from utils import get_dir, get_svgpng_heatmap
 
 
 def plot_heatmap(dataset: str = 'mnist', 
@@ -34,9 +34,10 @@ def plot_heatmap(dataset: str = 'mnist',
                  n_trial: int = 10, 
                  boundary: float = 0.99, 
                  n_channel: int = 3,
-                 likelihood_method: list = ['clean', 'pgd'],
-                 likelihood_epsilon: list = [0, 0.3],
-                 mode: str = 'attack'):
+                 likelihood_method: list = ['clean'],
+                 likelihood_epsilon: list = [0],
+                 mode: str = 'attack',
+                 save_single_heatmap: bool = False):
     """
     Plot accuracy heatmap of all dropout rates and attacks combinations.
 
@@ -68,8 +69,19 @@ def plot_heatmap(dataset: str = 'mnist',
         posterior belief decision boundary. The default is 0.99.
     n_channel : int, optional
         number of channel for likelihood estimation. The default is 3.
+    likelihood_method : list, optional
+        strings of attack methods for likelihood estimation, only for bayes inference. 
+        The default is ['clean'].
+    likelihood_epsilon : list, optional
+        floats of attack epsilons for likelihood estimation, only for bayes inference. 
+        The default is [0].
     mode : str, optional
-        DESCRIPTION. The default is 'attack'.
+        name of defense method, should be chosen from [attack|cumsum|bayes]. 
+        when assign 'attack', it means model defense solely by dropout.
+        The default is 'attack'.
+    save_single_heatmap : bool, optional
+        whether save each heatmap into single .svg and .png files.
+        The default is False.
 
     Returns
     -------
@@ -115,25 +127,39 @@ def plot_heatmap(dataset: str = 'mnist',
     plt.setp(axes, xticks=range(n_dropout), xticklabels=xticklabels,
              yticks=range(n_dropout), yticklabels=yticklabels)
     subtitle = [METHOD_TITLE[i] for i in method]
+    svg_heatmap, png_heatmap = get_svgpng_heatmap(dataset, architecture, index, 
+                                                  method, subset, mode, 
+                                                  likelihood_method)
+
     for i in range(n_subplot):
         a = acc[:, :, i]
-        im = axes[i].imshow(a, norm=Normalize(0, 1))
-        idx = np.unravel_index(np.argmax(a), a.shape)
-        table[2, i] = dropout[idx[0]]
-        table[3, i] = dropout[idx[1]]
-        t = ' (%.1f, %.1f: %.4f)'%(table[2, i], table[3, i], table[1, i])
-        axes[i].set_title(subtitle[i] + t)
+        
+        if save_single_heatmap:
+            fig = plt.figure()
+            plt.axis('off')
+            im = plt.imshow(a, vmin=0, vmax=1)
+            plt.savefig(svg_heatmap[i], bbox_inches='tight', pad_inches=0)
+            plt.savefig(png_heatmap[i], dpi=300, bbox_inches='tight', pad_inches=0)
+            
+        else:
+            im = axes[i].imshow(a, vmin=0, vmax=1, norm=Normalize(0, 1))
+            idx = np.unravel_index(np.argmax(a), a.shape)
+            table[2, i] = dropout[idx[0]]
+            table[3, i] = dropout[idx[1]]
+            t = ' (%.1f, %.1f: %.4f)'%(table[2, i], table[3, i], table[1, i])
+            axes[i].set_title(subtitle[i] + t)
 
-    axes[0].set_ylabel('Training Dropout Rate')
-    axes[n_subplot//2].set_xlabel('Testing Dropout Rate')
-    # color bar for heatmap
-    divider = make_axes_locatable(axes[-1])
-    cax = divider.append_axes("right", size="5%", pad=0.05)
-    plt.colorbar(im, cax=cax)
-    title = mode if mode != 'attack' else 'dropout'
-    fig.suptitle(title)
-    fig.show()
-
+    if not save_single_heatmap:
+        axes[0].set_ylabel('Training Dropout Rate')
+        axes[n_subplot//2].set_xlabel('Testing Dropout Rate')
+        # color bar for heatmap
+        divider = make_axes_locatable(axes[-1])
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        plt.colorbar(im, cax=cax)
+        title = mode if mode != 'attack' else 'dropout'
+        fig.suptitle(title)
+        fig.show()
+    
     return acc, table
 
 
@@ -280,8 +306,8 @@ def plot_epsilon_accrt(dataset: str = 'mnist',
                        inference: str = 'bayes',
                        boundary: float = 0.99, 
                        n_channel: int = 3,
-                       likelihood_method: list = ['clean', 'pgd'],
-                       likelihood_epsilon: list = None):
+                       likelihood_method: list = ['clean'],
+                       likelihood_epsilon: list = [0]):
     """
     Plot relationship of epsilon-accuracy and epsilon-response_time.
 
@@ -315,6 +341,12 @@ def plot_epsilon_accrt(dataset: str = 'mnist',
         posterior belief decision boundary. The default is 0.99.
     n_channel : int, optional
         number of channel for likelihood estimation. The default is 3.
+    likelihood_method : list, optional
+        strings of attack methods for likelihood estimation, only for bayes inference. 
+        The default is ['clean'].
+    likelihood_epsilon : list, optional
+        floats of attack epsilons for likelihood estimation, only for bayes inference. 
+        The default is [0].
 
     Returns
     -------
@@ -351,6 +383,7 @@ def plot_epsilon_accrt(dataset: str = 'mnist',
             load_func = load_cumsum
         if inference == 'bayes':
             load_func = load_bayes
+            # TODO: specify likelihood epsilon for each attack epsilon
             if likelihood_epsilon is None:
                 likelihood_epsilon_current = [0, eps]
             else:
@@ -517,29 +550,32 @@ def plot_failbayes_histogram(dataset: str = 'cifar10',
 
 
 if __name__ == '__main__':
-    dataset = 'imdb'
-    architecture = 'lstm'
-    method = ['clean', 'textbugger']
-    epsilon = [0, 0]
+    dataset = 'mnist'
+    architecture = 'cnn'
+    method = ['clean', 'pgd', 'cwl2', 'spatial']
+    epsilon = [0, 0.3, 0, 0]
     proportion = 0.1
-    # acc0, table0 = plot_heatmap(dataset, architecture, method=method, 
-    #                             epsilon=epsilon, proportion=proportion)
-    # acc1, table1 = plot_heatmap(dataset, architecture, method=method, 
-    #                             epsilon=epsilon, proportion=proportion, 
-    #                             boundary=5, mode='cumsum')
-    # acc2, table2 = plot_heatmap(dataset, architecture, method=method, 
-    #                             epsilon=epsilon, proportion=proportion, 
-    #                             mode='bayes', n_channel=3, 
-    #                             likelihood_method=['clean'], 
-    #                             likelihood_epsilon=[0])
-    acc3, table3 = plot_heatmap(dataset, architecture, method=method, 
+    acc0, table0 = plot_heatmap(dataset, architecture, method=method, 
                                 epsilon=epsilon, proportion=proportion, 
-                                mode='bayes', n_channel=2,
-                                likelihood_method=['clean', 'textbugger'], 
-                                likelihood_epsilon=[0, 0])
+                                save_single_heatmap=True)
+    acc1, table1 = plot_heatmap(dataset, architecture, method=method, 
+                                epsilon=epsilon, proportion=proportion, 
+                                boundary=5, mode='cumsum',
+                                save_single_heatmap=True)
+    acc2, table2 = plot_heatmap(dataset, architecture, method=method, 
+                                epsilon=epsilon, proportion=proportion, 
+                                mode='bayes', n_channel=3, 
+                                likelihood_method=['clean'], 
+                                likelihood_epsilon=[0],
+                                save_single_heatmap=True)
+    # acc3, table3 = plot_heatmap(dataset, architecture, method=method, 
+    #                             epsilon=epsilon, proportion=proportion, 
+    #                             mode='bayes', n_channel=3,
+    #                             likelihood_method=['clean', 'imperceptible'], 
+    #                             likelihood_epsilon=[0, 0.05])
     
-    # plot_epsilon_accrt(dropout_train=0.2, dropout_test=0.6, proportion=proportion,
-                       # likelihood_method=['clean'], likelihood_epsilon=[0])
+    # plot_epsilon_accrt(dropout_train=0, dropout_test=0.8, proportion=proportion,
+    #                    likelihood_method=['clean'], likelihood_epsilon=[0])
     
     # plot_epsilon_accrt(dataset, architecture, 0, dropout_train=0.2, 
     #                    dropout_test=0.6, epsilon=EPSILON_MNIST_FIGURE, 
