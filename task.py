@@ -10,26 +10,39 @@ prepare data for training and testing
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset, DataLoader, random_split
+
 from torchvision.datasets import MNIST, CIFAR10
 from torchvision.transforms import (ToTensor, Compose, Normalize, 
                                     RandomHorizontalFlip, ToPILImage)
-from torch.utils.data import Dataset, DataLoader, random_split
+
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import GloVe
 from torchtext.datasets import IMDB
+
+from torchaudio.datasets.speechcommands import SPEECHCOMMANDS
 
 from utils import (get_npz, get_npz_output, get_npz_attack, get_npz_likelihood, 
                    get_npz_bayes, get_npz_cumsum, mkdir_dataset)
 
 
 # available name of dataset
-DATASET = ['mnist', 'cifar10', 'imdb']
+DATASET = ['mnist', 'cifar10', 'imdb', 'speechcommands']
 DATASET_VISION = ['mnist', 'cifar10']
 DATASET_TEXT = ['imdb']
+DATASET_AUDIO = ['speechcommands']
 for i in DATASET:
     mkdir_dataset(i)
 # directory containing dataset files
-DATASET_DIRECTORY = {'mnist': 'data', 'cifar10': 'data', 'imdb': 'data'}
+DATASET_DIRECTORY = {'mnist': 'data', 'cifar10': 'data', 'imdb': 'data',
+                     'speechcommands': 'data'}
+SPEECHCOMMANDS_LABEL = ["zero", "one", "two", "three", "four", "five", "six", 
+                        "seven", "eight", "nine", 
+                        "yes", "no", "up", "down", "left", "right", "on", "off", 
+                        "stop", "go", "backward", "forward", "follow", "learn",
+                        "bed", "bird", "cat", "dog", "happy", "house", "marvin", 
+                        "sheila", "tree", "wow", "visual"]
+SPEECHCOMMANDS_SAMPLINGRATE = 16000
 
 
 class TextToTensor:
@@ -185,6 +198,37 @@ def get_dataset(dataset: str = 'mnist',
     """
     dataset_directory = DATASET_DIRECTORY[dataset]
     generator = torch.Generator().manual_seed(0)
+    
+    if dataset == 'speechcommands':
+        subset_dict = {'train': 'training', 'val': 'validation', 'test': 'testing'}
+        ds = SPEECHCOMMANDS(dataset_directory, subset=subset_dict[subset])
+        n_sample = int(ds.__len__() * proportion)
+        subset_return, _ = random_split(ds, [n_sample, ds.__len__()-n_sample], 
+                                        generator=generator)
+        
+        x = []
+        y = []
+        length = 16000
+        for i in range(n_sample):
+            # waveform, sample_rate, label, speaker_id, utterance_number
+            item = subset_return.__getitem__(i)
+            x_i = item[0]
+            # pad waveform if shorter than one second
+            x_len = x_i.shape[-1]
+            if x_len < length:
+                x_i = torch.cat([x_i, torch.zeros([1, length-x_len])], dim=-1)
+            # cut waveform if longer than one second
+            elif x_len > length:
+                x_i = x_i[:, :length]
+                
+            x.append(x_i[0])
+            y.append(SPEECHCOMMANDS_LABEL.index(item[2]))
+            
+        x = torch.stack(x)
+        dataset_return = CustomDataset(x, y)
+        return dataset_return
+          
+    
     if subset in ['train', 'val']:
         if dataset == 'mnist':
             train_data = MNIST(dataset_directory, True, ToTensor(), download=True)
@@ -334,6 +378,38 @@ def get_loader(dataset: str = 'mnist',
     return loader
 
 
+def iter2array(x):
+    """
+    Convert list or torch.Tensor into numpy.ndarray
+
+    Parameters
+    ----------
+    x : iterable type 
+        list, torch.Tensor or numpy.ndarray.
+
+    Raises
+    ------
+    Exception
+        x belongs to other types.
+
+    Returns
+    -------
+    x : np.ndarray
+        converted x.
+
+    """
+    if isinstance(x, np.ndarray):
+        pass
+    elif isinstance(x, torch.Tensor):
+        x = x.numpy()
+    elif isinstance(x, list):
+        x = np.array(x)
+    else:
+        raise Exception("Invalid type: %s"%str(type(x))) 
+    
+    return x
+
+
 def get_y(dataset: str = 'mnist',
           subset: str = 'test',
           proportion: float = 1,
@@ -354,23 +430,14 @@ def get_y(dataset: str = 'mnist',
 
     Returns
     -------
-    x : torch.Tensor
-        inputs.
-    y : torch.Tensor
+    y : np.ndarray
         labels.
 
     """
     dataset_torch = get_dataset(dataset, subset, proportion)
 
     y = dataset_torch.targets
-    if isinstance(y, np.ndarray):
-        pass
-    elif isinstance(y, torch.Tensor):
-        y = y.numpy()
-    elif isinstance(y, list):
-        y = np.array(y)
-    else:
-        raise Exception("Invalid type: %s"%str(type(y)))
+    y = iter2array(y)
     if onehot:
         y = np.eye(np.max(y)+1)[y]
 
@@ -824,7 +891,7 @@ def load_acc(mode: str, *args: list):
 
 
 if __name__ == '__main__':
-    ds = get_dataset('cifar10', proportion=0.5)
+    ds = get_dataset('speechcommands', proportion=0.1)
     # dl = get_loader(dataset='imdb', proportion=0.5)
     # for x, y in dl:
     #     x = x.numpy()
