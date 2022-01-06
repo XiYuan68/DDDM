@@ -10,18 +10,25 @@ inference.
 """
 from time import time
 import subprocess
+from itertools import permutations
+from typing import Union
+from copy import deepcopy
 
 import torch
 import numpy as np
 from scipy.special import softmax
+from joblib import Parallel, delayed
+
+from cleverhans.torch.attacks.carlini_wagner_l2 import carlini_wagner_l2
 
 from foolbox import PyTorchModel
-from foolbox.attacks import PGD
+from foolbox.attacks import PGD, L2CarliniWagnerAttack, SpatialAttack
 import eagerpy as ep
 
 from task import (get_loader, get_trial, get_output_of_category, load_likelihood,
-                  DATASET_VISION, DATASET_TEXT)
-from model import (MNISTCNN, IMDBLSTM, CIFAR10RESNET, load_model, get_likelihood, 
+                  DATASET_TEXT, DATASET_AUDIO)
+from model import (MNISTCNN, IMDBLSTM, CIFAR10RESNET, SPEECHCOMMANDSDEEPSPEECH,
+                   load_model, get_likelihood, 
                    bayesian_inference, cumsum_inference)
 from utils import get_pt_model, get_npz, update_trainlog
 
@@ -32,8 +39,8 @@ MULTIGPU = torch.cuda.device_count() > 1
 PROPORTION = 0.1
 DROPOUT = [0, 0.2, 0.4, 0.6, 0.8]
 
-METHOD_MNIST = ['clean', 'pgd']
-EPSILON_MNIST = [0, 0.3]
+METHOD_MNIST = ['clean', 'pgd', 'cwl2', 'spatial']
+EPSILON_MNIST = [0, 0.3, 0, 0]
 EPSILON_MNIST_FIGURE = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
 
 METHOD_CIFAR10 = ['clean', 'pgd']
@@ -43,7 +50,12 @@ EPSILON_CIFAR10_FIGURE = [0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.035, 0.04,
 METHOD_IMDB = ['clean', 'textbugger']
 EPSILON_IMDB = [0, 0]
 
-METHOD_TITLE = {'clean': 'Clean', 'pgd': 'PGD', 'textbugger': 'TextBugger'}
+METHOD_SPEECHCOMMANDS = ['clean', 'imperceptible']
+EPSILON_SPEECHCOMMANDS = [0, 0.05]
+
+METHOD_TITLE = {'clean': 'Clean', 'pgd': 'PGD', 'cwl2': 'C&W L2', 
+                'spatial': 'Spatial', 'textbugger': 'TextBugger',
+                'imperceptible': 'Imperceptible'}
 
 
 class AccuracyGetter:
@@ -54,6 +66,8 @@ class AccuracyGetter:
             self.feature_dim = -1   
         elif dataset == 'cifar10' and architecture == 'resnet':
             self.feature_dim = 1
+        elif dataset == 'speechcommands' and architecture == 'deepspeech':
+            self.feature_dim = -1
         else:
             raise Exception('Wrong dataset and architecture combination: %s + %s'%(dataset, architecture))
         self.n_sample = 0
@@ -230,16 +244,8 @@ def train_model(dataset='mnist',
     print('Training', dataset, architecture, index, dropout)
     
     update_trainlog(dataset, architecture, index, dropout, mode='w')
-    if dataset == 'mnist' and architecture == 'cnn':
-        model = MNISTCNN(dropout).to(device)
-    elif dataset == 'imdb' and architecture == 'lstm':
-        model = IMDBLSTM(dropout=dropout).to(device)
-    elif dataset == 'cifar10' and architecture == 'resnet':
-        # https://github.com/akamaster/pytorch_resnet_cifar10/raw/master/pretrained_models/resnet20-12fca82f.th
-        th = 'data/cifar10/others/resnet20-12fca82f.th'
-        model = CIFAR10RESNET(dropout, th).to(device)
-    else:
-        raise Exception('Wrong dataset and architecture combination: %s + %s'%(dataset, architecture))
+    model = load_model(dataset, architecture, index, dropout, None,
+                       device, return_untrained=True)
     loss_func = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters())
     
@@ -331,7 +337,7 @@ def attack_model(dataset: str = 'mnist',
     """
     print('Attacking', dataset, architecture, index, dropout_train, dropout_test, 
           method, epsilon, subset, proportion)
-    if dataset in DATASET_TEXT and method != 'clean':
+    if dataset in DATASET_TEXT+DATASET_AUDIO and method != 'clean':
         print('Skipping')
         return 0
         
@@ -354,30 +360,46 @@ def attack_model(dataset: str = 'mnist',
     else:
         if dataset == 'mnist':
             preprocessing = None
-            if method == 'pgd':
-                attack = PGD()
         elif dataset == 'cifar10':
             preprocessing = dict(mean=[0.485, 0.456, 0.406],
-                                  std=[0.229, 0.224, 0.225],
-                                  axis=-3)
-            if method == 'pgd':
-                # attack = PGD(rel_stepsize=0.01/epsilon, steps=200)
-                attack = PGD()
+                                 std=[0.229, 0.224, 0.225],
+                                 axis=-3)
         else:
             raise Exception('Wrong dataset: %s'%dataset)
+
+        if method == 'pgd':
+            attack = PGD()
+        # here we use the cleverhans C&W L2 implemantation, which is faster and 
+        # has higher success rate
+        elif method == 'cwl2':
+            # attack = L2CarliniWagnerAttack(stepsize=0.1)
+            pass
+        elif method == 'spatial':
+            attack = SpatialAttack()
+
+
         fmodel = PyTorchModel(model, bounds=(0,1), preprocessing=preprocessing)
 
 
         if_attacked = []
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            x, y = ep.astensors(x, y)
-            _, x_adv, success = attack(fmodel, x, y, epsilons=epsilon)
+            if method != 'cwl2':
+                x, y = ep.astensors(x, y)
+                _, x_adv, success = attack(fmodel, x, y, epsilons=epsilon)
+            else:
+                # TODO: maybe there should be some preprocessing here 
+                # if attacking resnet
+                x_adv = carlini_wagner_l2(model, x, 10)
+                pred_adv = torch.argmax(model(x_adv), axis=-1)
+                x_adv = x_adv.cpu()
+                success = (pred_adv != y).cpu()
             x_attacked.append(x_adv.numpy())
             if_attacked += list(success.numpy())
         
         x_attacked = np.concatenate(x_attacked)
         acc = 1 - np.mean(if_attacked)
+
 
     print('Acc: %f'%acc)
     if save:
@@ -544,8 +566,8 @@ def save_inference(dataset: str = 'mnist',
                    boundary: float = 0.99,
                    n_channel: int = 3,
                    repeat_train: int = 10,
-                   likelihood_method: list = ['clean', 'pgd'],
-                   likelihood_epsilon: list = [0, 0.3]): 
+                   likelihood_method: list = ['clean'],
+                   likelihood_epsilon: list = [0]): 
     """
     Save cumsum/bayesian inference results.
 
@@ -589,10 +611,10 @@ def save_inference(dataset: str = 'mnist',
         The default is 10.
     likelihood_method : list, optional
         strings of attack methods for likelihood estimation, only for bayes inference. 
-        The default is ['clean', 'pgd'].
+        The default is ['clean'].
     likelihood_epsilon : list, optional
         floats of attack epsilons for likelihood estimation, only for bayes inference. 
-        The default is [0, 0.3].
+        The default is [0].
         
 
     Returns
@@ -721,13 +743,36 @@ def train_model_multidropout(dataset='mnist',
                         save, patience, device, num_workers)
 
 
+def get_dropout_pair(dropout_train: list = DROPOUT, dropout_test: list = DROPOUT):
+    """
+    Return cartesian product of given training and testing dropout rates.
+
+    Parameters
+    ----------
+    dropout_train : list, optional
+        training dropout rates. The default is DROPOUT.
+    dropout_test : list, optional
+        testing dropout rates. The default is DROPOUT.
+
+    Returns
+    -------
+    dropout_pair : list
+        training and testing dropout rate pairs.
+
+    """
+    dropout_pair = []
+    for i in dropout_train:
+        for j in dropout_test:
+            dropout_pair.append((i, j))
+    return dropout_pair
+
+
 def pipeline(dataset: str = 'mnist', 
              architecture: str = 'cnn',
              index: int = 0, 
-             dropout_train: float = 0, 
-             dropout_test: float = 0,
+             dropout_pair: Union[list, tuple] = (0, 0), 
              method: str = 'clean', 
-             epsilon: float = 0, 
+             epsilon: Union[float, int, list] = 0, 
              proportion_train: float = PROPORTION, 
              repeat_train: int = 10,
              proportion_test: float = PROPORTION,
@@ -741,10 +786,15 @@ def pipeline(dataset: str = 'mnist',
              device: torch.device = DEVICE,
              num_workers: int = 4,
              likelihood_method: list = ['clean'],
-             likelihood_epsilon: list = [0]):
+             likelihood_epsilon: list = [0],
+             likelihood_estimate: bool = True):
     """
     Convenient function to attack neural networks, estimate likelihood and 
     perform cumsum and bayesian inference.
+    
+    Cumsum inference, likelihood estimation and bayesian inference will be 
+    processed in a CPU parallel fashion if multiple dropout rate pairs and/or
+    multiple epsilon values are given.
 
     Parameters
     ----------
@@ -754,13 +804,17 @@ def pipeline(dataset: str = 'mnist',
         architecture of the neural network. The default is 'cnn'.
     index : int, optional
         index of data to return. The default is 0.
-    dropout : list, optional
-        training and testing dropout rates. The default is DROPOUT.
+    dropout_pair : Union[list, tuple], optional
+        training and testing dropout rate pair(s). 
+        single dropout rate pair should be in the form as (d_train, d_test).
+        multiple dropout rate pairs should be in the form as 
+        [(d_train_0, d_test_0), (d_train_1, d_test_1), (d_train_2, d_test_2), ...],
+        which could be returned by get_dropout_pair().
+        The default is (0, 0).
     method : str, optional
         adversarial attack method. The default is 'clean'.
-    epsilon : float, optional
+    epsilon : Union[float, int, list], optional
         perturbation threshold of attacks. The default is 0.
-
     proportion_train : float, optional
         proportion of training set. The default is 1.
     repeat_train : int, optional
@@ -785,29 +839,63 @@ def pipeline(dataset: str = 'mnist',
         device on which the model is loaded. The default is DEVICE.
     num_workers: int, optional
         how many subprocesses to use for data. The default is 4.
+    likelihood_method : list, optional
+        strings of attack methods for likelihood estimation, only for bayes inference. 
+        The default is ['clean'].
+    likelihood_epsilon : list, optional
+        floats of attack epsilons for likelihood estimation, only for bayes inference. 
+        The default is [0].
+    likelihood_estimate : bool, optional
+        whether estimate likelihood. The default is True.
+
+    Returns
+    -------
+    None.
 
     """
-    
-    spr = [['train', 'test'], 
-           [proportion_train, proportion_test], 
-           [repeat_train, repeat_test]]
 
-    for s, p, r in zip(*spr):
-        attack_model(dataset, architecture, index, dropout_train, dropout_test, 
-                        method, epsilon, s, p, batch_size, True, device, num_workers)
-        save_output(dataset, architecture, index, dropout_train, dropout_test, 
-                    method, epsilon, s, p, r, batch_size, device, num_workers)
+    if likelihood_method == ['clean'] and method != 'clean':
+        spr = [['test'], 
+               [proportion_test], 
+               [repeat_test]]
+    else:
+        spr = [['train', 'test'], 
+               [proportion_train, proportion_test], 
+               [repeat_train, repeat_test]]        
+
+    args_likelihood = []
+    args_cumsum = []
+    args_bayes = []
     
-    save_inference(dataset, architecture, index, dropout_train, dropout_test, 
-                    method, epsilon, 'test', proportion_test, repeat_test, 
-                    len_trial, n_trial, 'cumsum', boundary_cumsum)
-    save_likelihood(dataset, architecture, index, dropout_train, dropout_test, 
-                    likelihood_method, likelihood_epsilon, 'train', 
-                    proportion_train, repeat_train, n_channel)
-    save_inference(dataset, architecture, index, dropout_train, dropout_test, 
-                    method, epsilon, 'test', proportion_test, repeat_test, 
-                    len_trial, n_trial, 'bayes', boundary_bayes, n_channel, 
-                    repeat_train, likelihood_method, likelihood_epsilon)
+    if isinstance(epsilon, float) or isinstance(epsilon, int):
+        epsilon = [epsilon]        
+    if isinstance(dropout_pair, tuple):
+        dropout_pair = [dropout_pair]
+
+    for i, j in dropout_pair:
+        for e in epsilon:
+            for s, p, r in zip(*spr):
+                attack_model(dataset, architecture, index, i, j, method, e, 
+                             s, p, batch_size, True, device, num_workers)
+                save_output(dataset, architecture, index, i, j, method, e, 
+                            s, p, r, batch_size, device, num_workers)
+            
+            args_cumsum.append([dataset, architecture, index, i, j, method, 
+                                e, 'test', proportion_test, repeat_test, 
+                                len_trial, n_trial, 'cumsum', boundary_cumsum])
+            args_likelihood.append([dataset, architecture, index, i, 
+                                    j, likelihood_method, likelihood_epsilon, 
+                                    'train', proportion_train, repeat_train, 
+                                    n_channel])
+            args_bayes.append([dataset, architecture, index, i, j, method, 
+                               e, 'test', proportion_test, repeat_test, 
+                               len_trial, n_trial, 'bayes', boundary_bayes, 
+                               n_channel, repeat_train, likelihood_method, 
+                               likelihood_epsilon])
+    Parallel(-1)(delayed(save_inference)(*i) for i in args_cumsum)
+    if likelihood_estimate:
+        Parallel(-1)(delayed(save_likelihood)(*i) for i in args_likelihood)
+    Parallel(-1)(delayed(save_inference)(*i) for i in args_bayes)
 
     
 
@@ -821,41 +909,36 @@ if __name__ == '__main__':
     batch_size = 512
     n_channel = 3
     args = []
-    # save_output(dataset, architecture, index, 0.4, 0.6, 'pgd', 0.031, )
-    # save_inference(dataset, architecture, index, 0.4, 0.6, 'pgd', 0.031, 
-    #                inference='cumsum', boundary=5)
-
-    # pipeline(dataset, architecture, index, 0.4, 0.6, 'pgd', 0.031, 
-    #           proportion_train=proportion_train, 
-    #           proportion_test=proportion_test,
-    #           n_channel=n_channel,
-    #           batch_size=batch_size,
-    #           likelihood_method=['clean', 'pgd'], 
-    #           likelihood_epsilon=[0, 0.031])
-    train_model(dataset, architecture, index, dropout=0.8, batch_size=128, save=False)
-    # train_model(dataset, architecture, index, dropout=0.2, batch_size=128)
-    # train_model(dataset, architecture, index, dropout=0.6, batch_size=128)
-    # attack_model(dataset, architecture, index, method='pgd', epsilon=0.031)
-    
+    lm = ['clean']
+    le = [0]
+    # pipeline()
+    # pipeline(method='pgd', epsilon=0.3)
+    # pipeline(method='cwl2', epsilon=1.5)
+    # pipeline(method='spatial', epsilon=0)
     # for i in DROPOUT:
-    #     for j in DROPOUT:
-    #         for m, e in zip(METHOD_CIFAR10, EPSILON_CIFAR10):
-    #             lm = ['clean', 'pgd']
-    #             le = [0, 0.031]
-    #             pipeline(dataset, architecture, index, i, j, m, e, 
-    #                       proportion_train=proportion_train, 
-    #                       proportion_test=proportion_test,
-    #                       n_channel=n_channel,
-    #                       batch_size=batch_size,
-    #                       likelihood_method=lm, 
-    #                       likelihood_epsilon=le)
-    # i = 0.2
-    # j = 0.6
+    #     train_model(dataset, architecture, index, dropout=i,)
+    
+    # dropout_pair = get_dropout_pair([0.8], DROPOUT)
+    for m, e in zip(['cwl2'], [0]):
+
+        pipeline(dataset, architecture, index, get_dropout_pair(), m, e, 
+                 proportion_train=proportion_train, 
+                 proportion_test=proportion_test,
+                 n_channel=n_channel,
+                 batch_size=batch_size,
+                 likelihood_method=lm, 
+                 likelihood_epsilon=le)
+    # i = 0
+    # j = 0.8
     # m = 'pgd'
-    # for e in EPSILON_MNIST_FIGURE:
-    #     # attack_model(dataset, architecture, index, method='pgd', epsilon=e)
-    #     pipeline(dataset, architecture, index, i, j, m, e,
-    #               likelihood_method=['clean'], 
-    #               likelihood_epsilon=[0])
+    # e = deepcopy(EPSILON_MNIST_FIGURE)
+    # e.remove(0.3)
+    # pipeline_parallel(dataset, architecture, index, (i, j), m, e, 
+    #                   proportion_train=proportion_train, 
+    #                   proportion_test=proportion_test,
+    #                   n_channel=n_channel,
+    #                   batch_size=batch_size,
+    #                   likelihood_method=lm, 
+    #                   likelihood_epsilon=le)
 
     print('Cost %.2f mins'%((time() - time0) / 60))
