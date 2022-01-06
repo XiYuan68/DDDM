@@ -495,6 +495,45 @@ def backup_script():
     print('all scripts back-upped at', backup_dir)
 
 
+def get_svgpng_heatmap(dataset: str = 'mnist', 
+                       method: list = ['clean'], 
+                       mode: str = 'attack',
+                       likelihood_method: list = ['clean']):
+    """
+    
+
+    Parameters
+    ----------
+    dataset : str, optional
+        name of dataset. The default is 'mnist'.
+    method : list, optional
+        attack methods. The default is ['clean'].
+    mode : str, optional
+        name of defense method, should be chosen from [attack|cumsum|bayes]. 
+        when assign 'attack', it means model defense solely by dropout.
+        The default is 'attack'.
+    likelihood_method : list, optional
+        strings of attack methods for likelihood estimation, only for bayes inference. 
+        The default is ['clean'].
+
+    Returns
+    -------
+    svg_heatmap: list
+        .svg paths for each heatmpa.
+    png_heatmap: list
+        .png paths for each heatmpa.
+
+    """
+    dir_figure = get_dir(dataset, 'figure')
+    mode = 'dropout' if mode == 'attack' else mode
+    likelihood_method = 'none' if mode != 'bayes' else str(likelihood_method)
+    def get_svgpng(m, suffix='svg'):
+        return '.'.join(['heatmap', mode, m, likelihood_method, suffix])
+    svg_heatmap = [dir_figure + get_svgpng(i, 'svg') for i in method]
+    png_heatmap = [dir_figure + get_svgpng(i, 'png') for i in method]
+    return svg_heatmap, png_heatmap
+
+
 # create empty directories ./data/ and ./backup/ if not existing
 mkdir_databackup()
 
