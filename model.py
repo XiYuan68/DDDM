@@ -14,9 +14,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchaudio.transforms import MelSpectrogram
 
 from utils import get_pt_model
 from resnet import resnet20
+
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class MNISTCNN(nn.Module):
@@ -69,7 +73,7 @@ class MNISTCNN(nn.Module):
         return output
         
 
-class IMDBLSTM(nn.Module):
+class LSTM(nn.Module):
     """
     LSTM for IMDB classification task.
     structure and hyperparameters of the LSTM follow http://arxiv.org/abs/1509.01626
@@ -92,20 +96,16 @@ class IMDBLSTM(nn.Module):
     def __init__(self, 
                  input_size: int = 300, 
                  hidden_size: int = 512,
-                 proj_size: int = 2,
-                 dropout: float = 0,
-                 return_sequence: bool = False):
-        super(IMDBLSTM, self).__init__()
+                 dropout: float = 0):
+        super(LSTM, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.proj_size = proj_size
         self.dropout = dropout
-        self.return_sequence = return_sequence
         
         self.W = nn.Parameter(torch.Tensor(input_size, hidden_size * 4))
         self.U = nn.Parameter(torch.Tensor(hidden_size, hidden_size * 4))
         self.bias = nn.Parameter(torch.Tensor(hidden_size * 4))
-        self.project_layer = nn.Linear(hidden_size, proj_size) 
+        
         self.init_weights()
         pass
 
@@ -138,24 +138,31 @@ class IMDBLSTM(nn.Module):
             )
             c_t = f_t * c_t + i_t * g_t
             h_t = o_t * torch.tanh(c_t)
-            
-            if self.return_sequence:
-                sequence_element = self.project_layer(h_t)
-            else:
-                sequence_element = h_t
-            sequence.append(sequence_element.unsqueeze(0))
+            sequence.append(h_t.unsqueeze(0))
+        
         sequence = torch.cat(sequence, dim=0)
         # reshape from shape (sequence, batch, hidden_size | proj_size) to 
         # (batch, sequence, hidden_size | proj_size)
-        sequence = sequence.transpose(0, 1).contiguous()
+        sequence = sequence.transpose(0, 1).contiguous()  
+        return sequence          
+
+
+
+class IMDBLSTM(nn.Module):
+    def __init__(self,
+                 input_size: int = 300, 
+                 hidden_size: int = 512,
+                 proj_size: int = 2,
+                 dropout: float = 0):
+        self.lstm = LSTM(input_size, hidden_size, dropout)
+        self.project_layer = nn.Linear(hidden_size, proj_size) 
+    def forward(self, x: torch.Tensor, init_states: torch.Tensor = None):
+        batch_size, len_seq, _ = x.size()
+        sequence = self.lstm(x)
+        output = torch.mean(sequence, dim=1)
+        output = self.project_layer(output)
         
-        if self.return_sequence:
-            output = sequence
-        else:
-            output = torch.mean(sequence, dim=1)
-            output = self.project_layer(output)
-        
-        return output  
+        return output
 
 
 class CIFAR10RESNET(nn.Module):
@@ -225,16 +232,56 @@ class CIFAR10RESNET(nn.Module):
         y = self.resnet(x)
         return y
     
- 
+
+class SPEECHCOMMANDSDEEPSPEECH(nn.Module):
+    def __init__(self, dropout: float = 0, return_sequence: bool = False):
+        super(SPEECHCOMMANDSDEEPSPEECH, self).__init__()
+        self.dropout = dropout
+        self.spectrogram = MelSpectrogram()
+        self.conv1 = nn.Conv1d(128, 128, 3, 1)
+        # self.conv2 = nn.Conv1d(128, 128, 3, 1)
+        # self.conv3 = nn.Conv2d(32, 32, (21, 11), (2,1))
+        self.lstm1 = LSTM(128, 128, dropout)
+        self.lstm2 = LSTM(128, 128, dropout)
+        # self.lstm3 = LSTM(128, 128, dropout)
+        # self.lstm4 = LSTM(128, 128, dropout)
+        self.fc1 = nn.Linear(128, 128) 
+        self.project_layer = nn.Linear(128, 35) 
+
+
+    def forward(self, x: torch.Tensor, init_states: torch.Tensor = None):
+        """Assumes x is of shape (batch, sequence, feature)"""
+        dropout = nn.Dropout(self.dropout)
+        batch_size = x.shape[0]
+        
+        # [batch_size, 128, 81]
+        x = self.spectrogram(x)
+
+        x = self.conv1(x)
+        x = dropout(x)
+
+        x = torch.permute(x, [0, 2, 1])
+        
+        x = self.lstm1(x)
+        x = self.lstm2(x)
+        
+        x = self.fc1(x)
+        x = torch.mean(x, dim=1)
+        output = self.project_layer(x)
+        
+        return output
+        
+        return output         
+
 
 def load_model(dataset: str = 'mnist',
                architecture: str = 'cnn',
                index: int = 0, 
                dropout_train: float = 0, 
                dropout_test: float = 0,
-               device: torch.device = torch.device('cuda'),
+               device: torch.device = DEVICE,
                multigpu: bool = False,
-               return_sequence: bool = False):
+               return_untrained: bool = False):
     """
     Load a well-trained model and change its dropout rate.
 
@@ -262,14 +309,29 @@ def load_model(dataset: str = 'mnist',
     model : torch.nn.Module
         pytorch neural network classifier.    
     """
+    if return_untrained:
+        dropout_test = dropout_train
+        if dataset == 'cifar10' and architecture == 'resnet':
+            # https://github.com/akamaster/pytorch_resnet_cifar10/raw/master/pretrained_models/resnet20-12fca82f.th
+            th = 'data/cifar10/others/resnet20-12fca82f.th'
+        else:
+            th = None
+
     # define model
     if dataset == 'mnist' and architecture == 'cnn':
         model = MNISTCNN(dropout_test)
     elif dataset == 'imdb' and architecture == 'lstm':
-        model = IMDBLSTM(dropout=dropout_test, 
-                         return_sequence=return_sequence)
+        model = IMDBLSTM(dropout=dropout_test)
     elif dataset == 'cifar10' and architecture == 'resnet':
-        model = CIFAR10RESNET(dropout_test)
+        model = CIFAR10RESNET(dropout_test, th)
+    elif dataset == 'speechcommands' and architecture == 'deepspeech':
+        model = SPEECHCOMMANDSDEEPSPEECH(dropout_test)
+    else:
+        raise Exception('Wrong dataset and architecture combination: %s + %s'%(dataset, architecture))
+    
+    if return_untrained:
+        model = model.to(device)
+        return model
 
     # load pre-trained weights
     pt = get_pt_model(dataset, architecture, index, dropout_train)
