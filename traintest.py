@@ -22,11 +22,15 @@ from joblib import Parallel, delayed
 from cleverhans.torch.attacks.carlini_wagner_l2 import carlini_wagner_l2
 
 from foolbox import PyTorchModel
-from foolbox.attacks import PGD, L2CarliniWagnerAttack, SpatialAttack
+from foolbox.attacks import (FGSM, PGD, L2DeepFoolAttack, SpatialAttack,
+                             SaltAndPepperNoiseAttack, LinfRepeatedAdditiveUniformNoiseAttack)
 import eagerpy as ep
 
+from art.estimators.classification import PyTorchClassifier
+from art.attacks.evasion import SquareAttack
+
 from task import (get_loader, get_trial, get_output_of_category, load_likelihood,
-                  DATASET_TEXT, DATASET_AUDIO)
+                  DATASET_TEXT, DATASET_AUDIO, iter2array)
 from model import (MNISTCNN, IMDBLSTM, CIFAR10RESNET, SPEECHCOMMANDSDEEPSPEECH,
                    load_model, get_likelihood, 
                    bayesian_inference, cumsum_inference)
@@ -39,8 +43,9 @@ MULTIGPU = torch.cuda.device_count() > 1
 PROPORTION = 0.1
 DROPOUT = [0, 0.2, 0.4, 0.6, 0.8]
 
-METHOD_MNIST = ['clean', 'pgd', 'cwl2', 'spatial']
-EPSILON_MNIST = [0, 0.3, 0, 0]
+METHOD_MNIST = ['clean', 'fgsm', 'pgd', 'cwl2', 'deepfool', 
+                'spatial', 'saltpepper', 'uniform', 'square']
+EPSILON_MNIST = [0, 0.3, 0.3, 0, 1.5,    0, 1.5, 0.3, 0.3]
 EPSILON_MNIST_FIGURE = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
 
 METHOD_CIFAR10 = ['clean', 'pgd']
@@ -54,6 +59,8 @@ METHOD_SPEECHCOMMANDS = ['clean', 'imperceptible']
 EPSILON_SPEECHCOMMANDS = [0, 0.05]
 
 METHOD_TITLE = {'clean': 'Clean', 'pgd': 'PGD', 'cwl2': 'C&W L2', 
+                'deepfool': 'DeepFool L2', 'saltpepper': 'Salt&Pepper',
+                'uniform': 'Uniform Linf', 'square': 'Square Linf',
                 'spatial': 'Spatial', 'textbugger': 'TextBugger',
                 'imperceptible': 'Imperceptible'}
 
@@ -358,47 +365,73 @@ def attack_model(dataset: str = 'mnist',
     
     # attack model
     else:
-        if dataset == 'mnist':
-            preprocessing = None
-        elif dataset == 'cifar10':
-            preprocessing = dict(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225],
-                                 axis=-3)
-        else:
-            raise Exception('Wrong dataset: %s'%dataset)
-
-        if method == 'pgd':
-            attack = PGD()
-        # here we use the cleverhans C&W L2 implemantation, which is faster and 
-        # has higher success rate
-        elif method == 'cwl2':
-            # attack = L2CarliniWagnerAttack(stepsize=0.1)
-            pass
-        elif method == 'spatial':
-            attack = SpatialAttack()
-
-
-        fmodel = PyTorchModel(model, bounds=(0,1), preprocessing=preprocessing)
-
-
-        if_attacked = []
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            if method != 'cwl2':
-                x, y = ep.astensors(x, y)
-                _, x_adv, success = attack(fmodel, x, y, epsilons=epsilon)
-            else:
-                # TODO: maybe there should be some preprocessing here 
-                # if attacking resnet
-                x_adv = carlini_wagner_l2(model, x, 10)
-                pred_adv = torch.argmax(model(x_adv), axis=-1)
-                x_adv = x_adv.cpu()
-                success = (pred_adv != y).cpu()
-            x_attacked.append(x_adv.numpy())
-            if_attacked += list(success.numpy())
+        if method == 'square':
+            x = torch.cat([x for x, y in loader], dim=0)
+            x = iter2array(x)
+            y = iter2array(loader.dataset.targets)
+            
+            n_class = 10
+            # mnist or cifar10
+            input_shape = (1, 28, 28) if dataset == 'mnist' else (3, 32, 32)
+            classifier = PyTorchClassifier(model, torch.nn.CrossEntropyLoss(),
+                                           input_shape, n_class, 
+                                           clip_values=(0, 1))
+            attack = SquareAttack(classifier, eps=epsilon, batch_size=batch_size)
+            x_attacked = attack.generate(x=x)
+            pred = classifier.predict(x_attacked, batch_size=batch_size)
+            acc = np.mean(np.argmax(pred, axis=-1) == y)
         
-        x_attacked = np.concatenate(x_attacked)
-        acc = 1 - np.mean(if_attacked)
+        else:
+            if dataset == 'mnist':
+                preprocessing = None
+            elif dataset == 'cifar10':
+                preprocessing = dict(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225],
+                                     axis=-3)
+            else:
+                raise Exception('Wrong dataset: %s'%dataset)
+    
+            if method == 'pgd':
+                attack = PGD()
+            # here we use the cleverhans C&W L2 implemantation, which is faster and 
+            # has higher success rate
+            elif method == 'cwl2':
+                pass
+            elif method == 'spatial':
+                attack = SpatialAttack()
+            elif method == 'fgsm':
+                attack = FGSM()
+            elif method == 'deepfool':
+                attack = L2DeepFoolAttack()
+            elif method == 'saltpepper':
+                attack = SaltAndPepperNoiseAttack()
+            elif method == 'uniform':
+                attack = LinfRepeatedAdditiveUniformNoiseAttack()
+            else:
+                raise Exception('Invalid attack method: %s'%method)
+    
+    
+            fmodel = PyTorchModel(model, bounds=(0,1), preprocessing=preprocessing)
+    
+    
+            if_attacked = []
+            for x, y in loader:
+                x, y = x.to(device), y.to(device)
+                if method != 'cwl2':
+                    x, y = ep.astensors(x, y)
+                    _, x_adv, success = attack(fmodel, x, y, epsilons=epsilon)
+                else:
+                    # TODO: maybe there should be some preprocessing here 
+                    # if attacking resnet
+                    x_adv = carlini_wagner_l2(model, x, 10)
+                    pred_adv = torch.argmax(model(x_adv), axis=-1)
+                    x_adv = x_adv.cpu()
+                    success = (pred_adv != y).cpu()
+                x_attacked.append(x_adv.numpy())
+                if_attacked += list(success.numpy())
+            
+            x_attacked = np.concatenate(x_attacked)
+            acc = 1 - np.mean(if_attacked)
 
 
     print('Acc: %f'%acc)
@@ -814,7 +847,7 @@ def pipeline(dataset: str = 'mnist',
     method : str, optional
         adversarial attack method. The default is 'clean'.
     epsilon : Union[float, int, list], optional
-        perturbation threshold of attacks. The default is 0.
+        perturbation threshold(s) of attacks. The default is 0.
     proportion_train : float, optional
         proportion of training set. The default is 1.
     repeat_train : int, optional
@@ -911,6 +944,9 @@ if __name__ == '__main__':
     args = []
     lm = ['clean']
     le = [0]
+    method = 'square'
+    epsilon = EPSILON_MNIST[METHOD_MNIST.index(method)]
+    attack_model(dataset, architecture, method=method, epsilon=epsilon)
     # pipeline()
     # pipeline(method='pgd', epsilon=0.3)
     # pipeline(method='cwl2', epsilon=1.5)
@@ -919,15 +955,15 @@ if __name__ == '__main__':
     #     train_model(dataset, architecture, index, dropout=i,)
     
     # dropout_pair = get_dropout_pair([0.8], DROPOUT)
-    for m, e in zip(['cwl2'], [0]):
+    # for m, e in zip(['cwl2'], [0]):
 
-        pipeline(dataset, architecture, index, get_dropout_pair(), m, e, 
-                 proportion_train=proportion_train, 
-                 proportion_test=proportion_test,
-                 n_channel=n_channel,
-                 batch_size=batch_size,
-                 likelihood_method=lm, 
-                 likelihood_epsilon=le)
+    #     pipeline(dataset, architecture, index, get_dropout_pair(), m, e, 
+    #              proportion_train=proportion_train, 
+    #              proportion_test=proportion_test,
+    #              n_channel=n_channel,
+    #              batch_size=batch_size,
+    #              likelihood_method=lm, 
+    #              likelihood_epsilon=le)
     # i = 0
     # j = 0.8
     # m = 'pgd'
